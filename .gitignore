@@ -1,0 +1,21 @@
+# CMake build output
+/build/
+/build-*/
+
+# Generated CMake files
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+compile_commands.json
+
+# IDE and editor files
+.vs/
+.vscode/
+.idea/
+*.sln
+*.vcxproj*
+
+# Compiled binaries
+*.exe
+*.obj
+*.o
