@@ -5,8 +5,8 @@
 #include <iostream>
 #include <stdexcept>
 
-const int WIDTH = 800;
-const int HEIGHT = 600;
+const int WIDTH = 1200;
+const int HEIGHT = 900;
 
 class HelloTriangleApplication {
 public:
@@ -30,6 +30,7 @@ private:
     }
 
     void initVulkan() {
+        createInstance();
         // Vulkan initialization code goes here
     }
 
@@ -45,6 +46,10 @@ private:
 
         glfwTerminate();
         // Cleanup code goes here
+    }
+
+    void createInstance() {
+        
     }
 };
 
