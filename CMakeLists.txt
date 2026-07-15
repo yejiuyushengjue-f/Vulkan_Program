@@ -7,6 +7,8 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
+set(ENABLE_CXX_MODULES ON)
+
 find_package(Vulkan REQUIRED)
 
 set(GLFW_BUILD_DOCS OFF CACHE BOOL "" FORCE)
@@ -18,10 +20,12 @@ add_subdirectory(deps/glfw)
 add_subdirectory(deps/glm)
 
 file(GLOB_RECURSE SOURCE_FILES CONFIGURE_DEPENDS "src/*.cpp")
+file(GLOB_RECURSE MODULE_FILES CONFIGURE_DEPENDS "src/*.cppm")
 file(GLOB_RECURSE HEADER_FILES CONFIGURE_DEPENDS "include/*.h")
 
 add_executable(${PROJECT_NAME}
     ${SOURCE_FILES}
+    ${MODULE_FILES}
     ${HEADER_FILES}
 )
 
