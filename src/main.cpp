@@ -56,7 +56,7 @@ private:
     void initVulkan() {
         createInstance();
         setupDebugMessenger();
-    }
+    }   
 
     void mainLoop() {
         while (!glfwWindowShouldClose(window)) {
@@ -78,11 +78,13 @@ private:
             .apiVersion = vk::ApiVersion14,
         };
 
+        // Get required validation layers
         std::vector<const char*> requiredLayers;
         if (enableValidationLayers) {
             requiredLayers.assign(validationLayers.begin(), validationLayers.end());
         }
 
+        // Check if required validation layers are supported
         auto layerProperties = context.enumerateInstanceLayerProperties();
         auto unsupportedLayerIt = std::ranges::find_if(
             requiredLayers,
@@ -99,6 +101,7 @@ private:
                 "Required layer not supported: " + std::string(*unsupportedLayerIt));
         }
 
+        // Get required instance extensions
         auto requiredExtensions = getRequiredInstanceExtensions();
         auto extensionProperties = context.enumerateInstanceExtensionProperties();
         auto unsupportedExtensionIt = std::ranges::find_if(
@@ -111,11 +114,13 @@ private:
                     });
             });
 
+        // Check if required instance extensions are supported
         if (unsupportedExtensionIt != requiredExtensions.end()) {
             throw std::runtime_error(
                 "Required extension not supported: " + std::string(*unsupportedExtensionIt));
         }
 
+        // Create Vulkan instance
         vk::InstanceCreateInfo createInfo{
             .pApplicationInfo = &appInfo,
             .enabledLayerCount = static_cast<uint32_t>(requiredLayers.size()),
@@ -126,30 +131,8 @@ private:
 
         instance = vk::raii::Instance(context, createInfo);
     }
-
-    void setupDebugMessenger() {
-        if (!enableValidationLayers) {
-            return;
-        }
-
-        vk::DebugUtilsMessageSeverityFlagsEXT severityFlags{
-            vk::DebugUtilsMessageSeverityFlagBitsEXT::eWarning |
-            vk::DebugUtilsMessageSeverityFlagBitsEXT::eError,
-        };
-        vk::DebugUtilsMessageTypeFlagsEXT messageTypeFlags{
-            vk::DebugUtilsMessageTypeFlagBitsEXT::eGeneral |
-            vk::DebugUtilsMessageTypeFlagBitsEXT::ePerformance |
-            vk::DebugUtilsMessageTypeFlagBitsEXT::eValidation,
-        };
-        vk::DebugUtilsMessengerCreateInfoEXT createInfo{
-            .messageSeverity = severityFlags,
-            .messageType = messageTypeFlags,
-            .pfnUserCallback = &debugCallback,
-        };
-
-        debugMessenger = instance.createDebugUtilsMessengerEXT(createInfo);
-    }
-
+    
+    // Get required instance extensions function
     std::vector<const char*> getRequiredInstanceExtensions() {
         uint32_t glfwExtensionCount = 0;
         auto glfwExtensions = glfwGetRequiredInstanceExtensions(&glfwExtensionCount);
@@ -162,6 +145,7 @@ private:
         return extensions;
     }
 
+    // Set up debug callback function
     static VKAPI_ATTR vk::Bool32 VKAPI_CALL debugCallback(
         vk::DebugUtilsMessageSeverityFlagBitsEXT severity,
         vk::DebugUtilsMessageTypeFlagsEXT type,
@@ -174,6 +158,33 @@ private:
         }
 
         return vk::False;
+    }
+    
+    // Debug messenger setup
+    void setupDebugMessenger() {
+        if (!enableValidationLayers) {
+            return;
+        }
+
+        // Set up debug messenger
+        vk::DebugUtilsMessageSeverityFlagsEXT severityFlags{
+            vk::DebugUtilsMessageSeverityFlagBitsEXT::eWarning |
+            vk::DebugUtilsMessageSeverityFlagBitsEXT::eError,
+        };
+        vk::DebugUtilsMessageTypeFlagsEXT messageTypeFlags{
+            vk::DebugUtilsMessageTypeFlagBitsEXT::eGeneral |
+            vk::DebugUtilsMessageTypeFlagBitsEXT::ePerformance |
+            vk::DebugUtilsMessageTypeFlagBitsEXT::eValidation,
+        };
+
+        // Create debug messenger
+        vk::DebugUtilsMessengerCreateInfoEXT createInfo{
+            .messageSeverity = severityFlags,
+            .messageType = messageTypeFlags,
+            .pfnUserCallback = &debugCallback,
+        };
+
+        debugMessenger = instance.createDebugUtilsMessengerEXT(createInfo);
     }
 };
 
