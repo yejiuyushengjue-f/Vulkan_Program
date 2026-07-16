@@ -1,14 +1,22 @@
+#include <algorithm>
+#include <cstdlib>
+#include <cstring>
+#include <iostream>
+#include <ranges>
+#include <stdexcept>
+#include <string>
+
+#if defined(__INTELLISENSE__) || !defined(USE_CPP20_MODULES)
+#include <vulkan/vulkan_raii.hpp>
+#else
+import vulkan_hpp;
+#endif
+
 #define GLFW_INCLUDE_VULKAN
 #include <GLFW/glfw3.h>
 
-#include <cstdlib>
-#include <iostream>
-#include <stdexcept>
-#include <vector>
-#include <cstring>
-
-const int WIDTH = 1200;
-const int HEIGHT = 900;
+constexpr uint32_t WIDTH = 800;
+constexpr uint32_t HEIGHT = 600;
 
 class HelloTriangleApplication {
 public:
@@ -21,7 +29,8 @@ public:
 
 private:
     GLFWwindow* window = nullptr;
-    VkInstance instance = VK_NULL_HANDLE;
+    vk::raii::Context context;
+    vk::raii::Instance instance = nullptr;
 
     void initWindow() {
         glfwInit();
@@ -34,96 +43,56 @@ private:
 
     void initVulkan() {
         createInstance();
-        // Vulkan initialization code goes here
     }
 
     void mainLoop() {
         while (!glfwWindowShouldClose(window)) {
             glfwPollEvents();
         }
-        // Main rendering loop code goes here
     }
 
     void cleanup() {
-        vkDestroyInstance(instance, nullptr);
-        
         glfwDestroyWindow(window);
-
         glfwTerminate();
-        // Cleanup code goes here
     }
 
     void createInstance() {
-        // Vulkan Application Info
-        VkApplicationInfo appInfo{};
-        appInfo.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
-        appInfo.pApplicationName = "Hello Triangle";
-        appInfo.applicationVersion = VK_MAKE_VERSION(1, 0, 0);
-        appInfo.pEngineName = "No Engine";
-        appInfo.engineVersion = VK_MAKE_VERSION(1, 0, 0);
-        appInfo.apiVersion = VK_API_VERSION_1_0;
+        constexpr vk::ApplicationInfo appInfo{
+            .pApplicationName = "Hello Triangle",
+            .applicationVersion = VK_MAKE_VERSION(1, 0, 0),
+            .pEngineName = "No Engine",
+            .engineVersion = VK_MAKE_VERSION(1, 0, 0),
+            .apiVersion = vk::ApiVersion14,
+        };
 
-        // Vulkan Instance Create Info
-        VkInstanceCreateInfo createInfo{};
-        createInfo.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
-        createInfo.pApplicationInfo = &appInfo;
-        
-        // Get required extensions from GLFW
         uint32_t glfwExtensionCount = 0;
-        const char** glfwExtensions;
-        glfwExtensions = glfwGetRequiredInstanceExtensions(&glfwExtensionCount);
-        createInfo.enabledExtensionCount = glfwExtensionCount;
-        createInfo.ppEnabledExtensionNames = glfwExtensions;
+        auto glfwExtensions = glfwGetRequiredInstanceExtensions(&glfwExtensionCount);
 
-        // Check for extension support
-        uint32_t extensionCount = 0;
-        vkEnumerateInstanceExtensionProperties(nullptr, &extensionCount, nullptr);
-
-        std::vector<VkExtensionProperties> availableExtensions(extensionCount);
-        vkEnumerateInstanceExtensionProperties(nullptr, &extensionCount, availableExtensions.data());
-
-        std::cout << "Available Vulkan extensions:\n";
-        for (const auto& extension : availableExtensions) {
-            std::cout << "\t" << extension.extensionName << "\n";
-        }
-
-        if (checkExtensionSupport(glfwExtensions, glfwExtensionCount, availableExtensions)) {
-            std::cout << "All required extensions are supported.\n";
-        } else {
-            throw std::runtime_error("Not all required extensions are supported.");
-        }
-
-        // No validation layers for now
-        createInfo.enabledLayerCount = 0;
-
-        // Create Vulkan Instance
-        if (vkCreateInstance(&createInfo, nullptr, &instance) != VK_SUCCESS) {
-            throw std::runtime_error("failed to create Vulkan instance");
-        }
-    }
-
-    bool checkExtensionSupport(const char** requiredExtensions, uint32_t requiredCount, const std::vector<VkExtensionProperties>& availableExtensions) {
-        for (uint32_t i = 0; i < requiredCount; ++i) {
-            bool found = false;
-            for (const auto& extension : availableExtensions) {
-                if (strcmp(requiredExtensions[i], extension.extensionName) == 0) {
-                    found = true;
-                    break;
-                }
-            }
-            if (!found) {
-                std::cerr << "Required extension not found: " << requiredExtensions[i] << "\n";
-                return false;
+        auto extensionProperties = context.enumerateInstanceExtensionProperties();
+        for (uint32_t i = 0; i < glfwExtensionCount; ++i) {
+            if (std::ranges::none_of(
+                    extensionProperties,
+                    [glfwExtension = glfwExtensions[i]](auto const& extensionProperty) {
+                        return std::strcmp(extensionProperty.extensionName, glfwExtension) == 0;
+                    })) {
+                throw std::runtime_error(
+                    "Required GLFW extension not supported: " + std::string(glfwExtensions[i]));
             }
         }
-        return true;
+
+        vk::InstanceCreateInfo createInfo{
+            .pApplicationInfo = &appInfo,
+            .enabledExtensionCount = glfwExtensionCount,
+            .ppEnabledExtensionNames = glfwExtensions,
+        };
+
+        instance = vk::raii::Instance(context, createInfo);
     }
 };
 
 int main() {
-    HelloTriangleApplication app;
-
     try {
+        HelloTriangleApplication app;
         app.run();
     } catch (const std::exception& e) {
         std::cerr << e.what() << std::endl;

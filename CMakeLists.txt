@@ -1,15 +1,16 @@
-cmake_minimum_required(VERSION 3.20)
+cmake_minimum_required(VERSION 3.29)
 
 project(vulkan LANGUAGES C CXX)
 
-set(CMAKE_CXX_STANDARD 20)
-set(CMAKE_CXX_STANDARD_REQUIRED ON)
-set(CMAKE_CXX_EXTENSIONS OFF)
-set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+option(ENABLE_CPP20_MODULE "Enable C++20 module support for Vulkan" OFF)
 
-set(ENABLE_CXX_MODULES ON)
+if(ENABLE_CPP20_MODULE)
+    set(CMAKE_CXX_SCAN_FOR_MODULES ON)
+else()
+    set(CMAKE_CXX_SCAN_FOR_MODULES OFF)
+endif()
 
-find_package(Vulkan REQUIRED)
+find_package(Vulkan 1.4.335 REQUIRED)
 
 set(GLFW_BUILD_DOCS OFF CACHE BOOL "" FORCE)
 set(GLFW_BUILD_TESTS OFF CACHE BOOL "" FORCE)
@@ -19,20 +20,47 @@ set(GLFW_INSTALL OFF CACHE BOOL "" FORCE)
 add_subdirectory(deps/glfw)
 add_subdirectory(deps/glm)
 
-file(GLOB_RECURSE SOURCE_FILES CONFIGURE_DEPENDS "src/*.cpp")
-file(GLOB_RECURSE MODULE_FILES CONFIGURE_DEPENDS "src/*.cppm")
-file(GLOB_RECURSE HEADER_FILES CONFIGURE_DEPENDS "include/*.h")
+if(ENABLE_CPP20_MODULE)
+    add_library(VulkanCppModule)
+    add_library(Vulkan::cppm ALIAS VulkanCppModule)
 
-add_executable(${PROJECT_NAME}
-    ${SOURCE_FILES}
-    ${MODULE_FILES}
-    ${HEADER_FILES}
+    target_compile_definitions(VulkanCppModule PUBLIC
+        VULKAN_HPP_DISPATCH_LOADER_DYNAMIC=1
+        VULKAN_HPP_NO_STRUCT_CONSTRUCTORS=1
+    )
+    target_include_directories(VulkanCppModule PUBLIC "${Vulkan_INCLUDE_DIR}")
+    target_link_libraries(VulkanCppModule PUBLIC Vulkan::Vulkan)
+    set_target_properties(VulkanCppModule PROPERTIES CXX_STANDARD 20)
+
+    target_sources(VulkanCppModule PUBLIC
+        FILE_SET cxx_modules TYPE CXX_MODULES
+        BASE_DIRS "${Vulkan_INCLUDE_DIR}"
+        FILES "${Vulkan_INCLUDE_DIR}/vulkan/vulkan.cppm"
+    )
+else()
+    add_library(VulkanCppModule INTERFACE)
+    add_library(Vulkan::cppm ALIAS VulkanCppModule)
+
+    target_link_libraries(VulkanCppModule INTERFACE Vulkan::Vulkan)
+    target_compile_definitions(VulkanCppModule INTERFACE
+        VULKAN_HPP_DISPATCH_LOADER_DYNAMIC=1
+        VULKAN_HPP_NO_STRUCT_CONSTRUCTORS=1
+    )
+endif()
+
+add_executable(${PROJECT_NAME} src/main.cpp)
+set_target_properties(${PROJECT_NAME} PROPERTIES
+    CXX_STANDARD 20
+    CXX_STANDARD_REQUIRED ON
+    CXX_EXTENSIONS OFF
 )
 
-target_include_directories(${PROJECT_NAME} PRIVATE include)
-
 target_link_libraries(${PROJECT_NAME} PRIVATE
-    Vulkan::Vulkan
+    Vulkan::cppm
     glfw
     glm::glm
 )
+
+if(ENABLE_CPP20_MODULE)
+    target_compile_definitions(${PROJECT_NAME} PRIVATE USE_CPP20_MODULES=1)
+endif()
