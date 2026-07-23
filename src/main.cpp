@@ -49,12 +49,14 @@ private:
     vk::raii::Context context;
     vk::raii::Instance instance = nullptr;
     vk::raii::DebugUtilsMessengerEXT debugMessenger = nullptr;
+    vk::raii::SurfaceKHR surface = nullptr;
     vk::raii::PhysicalDevice physicalDevice = nullptr;
     vk::raii::Device device = nullptr;
-    vk::raii::Queue graphicsQueue = nullptr;
-    uint32_t graphicsQueueFamilyIndex = 0;
+    vk::raii::Queue graphicsPresentQueue = nullptr;
+    uint32_t graphicsPresentQueueFamilyIndex = 0;
 
-    void initWindow() {
+    void initWindow()
+    {
         glfwInit();
 
         glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
@@ -63,25 +65,30 @@ private:
         window = glfwCreateWindow(WIDTH, HEIGHT, "Vulkan", nullptr, nullptr);
     }
 
-    void initVulkan() {
+    void initVulkan()
+    {
         createInstance();
         setupDebugMessenger();
+        createSurface();
         pickPhysicalDevice();
         createLogicalDevice();
     }
 
-    void mainLoop() {
+    void mainLoop()
+    {
         while (!glfwWindowShouldClose(window)) {
             glfwPollEvents();
         }
     }
 
-    void cleanup() {
+    void cleanup()
+    {
         glfwDestroyWindow(window);
         glfwTerminate();
     }
 
-    void createInstance() {
+    void createInstance()
+    {
         constexpr vk::ApplicationInfo appInfo{
             .pApplicationName = "Hello Triangle",
             .applicationVersion = VK_MAKE_VERSION(1, 0, 0),
@@ -145,7 +152,8 @@ private:
     }
     
     // Get required instance extensions function
-    std::vector<const char*> getRequiredInstanceExtensions() {
+    std::vector<const char*> getRequiredInstanceExtensions()
+    {
         uint32_t glfwExtensionCount = 0;
         auto glfwExtensions = glfwGetRequiredInstanceExtensions(&glfwExtensionCount);
         std::vector<const char*> extensions(glfwExtensions, glfwExtensions + glfwExtensionCount);
@@ -158,7 +166,8 @@ private:
     }
 
     // Set up debug callback function
-    static VKAPI_ATTR vk::Bool32 VKAPI_CALL debugCallback(
+    static VKAPI_ATTR vk::Bool32 VKAPI_CALL debugCallback
+    (
         vk::DebugUtilsMessageSeverityFlagBitsEXT severity,
         vk::DebugUtilsMessageTypeFlagsEXT type,
         const vk::DebugUtilsMessengerCallbackDataEXT* callbackData,
@@ -199,7 +208,20 @@ private:
         debugMessenger = instance.createDebugUtilsMessengerEXT(createInfo);
     }
 
-    bool isDeviceSuitable(const vk::raii::PhysicalDevice& device) {
+    // Create the platform-specific presentation surface through GLFW
+    void createSurface()
+    {
+        VkSurfaceKHR rawSurface = VK_NULL_HANDLE;
+        if (glfwCreateWindowSurface(*instance, window, nullptr, &rawSurface) != VK_SUCCESS) {
+            throw std::runtime_error("Failed to create window surface!");
+        }
+
+        surface = vk::raii::SurfaceKHR(instance, rawSurface);
+    }
+
+    // Check if a physical device is suitable for our needs
+    bool isDeviceSuitable(const vk::raii::PhysicalDevice& device)
+    {
         // Get the device type, supported API version, limits, and other properties
         const auto properties = device.getProperties();
 
@@ -208,8 +230,8 @@ private:
             return false;
         }
 
-        // Check if the device has a graphics queue
-        if (!findGraphicsQueueFamily(device)) {
+        // Check if one queue family supports both graphics commands and presentation
+        if (!findGraphicsAndPresentQueueFamily(device)) {
             return false;
         }
 
@@ -244,7 +266,8 @@ private:
     }
 
     // Pick the first physical device that satisfies every required capability
-    void pickPhysicalDevice() {
+    void pickPhysicalDevice()
+    {
         auto physicalDevices = instance.enumeratePhysicalDevices();
         if (physicalDevices.empty()) {
             throw std::runtime_error("Failed to find GPUs with Vulkan support!");
@@ -261,31 +284,39 @@ private:
         }
 
         physicalDevice = *suitableDevice;
-        graphicsQueueFamilyIndex = findGraphicsQueueFamily(physicalDevice).value();
+        graphicsPresentQueueFamilyIndex =
+            findGraphicsAndPresentQueueFamily(physicalDevice).value();
     }
 
-    // Find the first queue family that can execute graphics commands
-    std::optional<uint32_t> findGraphicsQueueFamily(const vk::raii::PhysicalDevice& device) const {
+    // Find the first queue family that can both draw and present to this window surface
+    std::optional<uint32_t> findGraphicsAndPresentQueueFamily(const vk::raii::PhysicalDevice& device) const
+    {
         const auto queueFamilies = device.getQueueFamilyProperties();
-        const auto graphicsQueueFamily = std::ranges::find_if(
-            queueFamilies,
-            [](const vk::QueueFamilyProperties& queueFamily) {
-                return queueFamily.queueCount > 0 &&
-                       static_cast<bool>(queueFamily.queueFlags & vk::QueueFlagBits::eGraphics);
-            });
 
-        if (graphicsQueueFamily == queueFamilies.end()) {
-            return std::nullopt;
+        for (uint32_t index = 0; index < queueFamilies.size(); ++index) {
+            const auto& queueFamily = queueFamilies[index];
+            const bool supportsGraphics =
+                queueFamily.queueCount > 0 &&
+                static_cast<bool>(queueFamily.queueFlags & vk::QueueFlagBits::eGraphics);
+            const bool supportsPresent =
+                supportsGraphics && device.getSurfaceSupportKHR(index, *surface);
+
+            if (supportsGraphics && supportsPresent) {
+                return index;
+            }
         }
 
-        return static_cast<uint32_t>(std::distance(queueFamilies.begin(), graphicsQueueFamily));
+        return std::nullopt;
     }
 
-    void createLogicalDevice() {
-        // Create one graphics queue; priorities must remain valid until device creation returns
+    // Create a logical device from the selected physical device
+    void createLogicalDevice()
+    {
+        // Create one queue that supports both graphics and presentation
+        // Queue priorities must remain valid until device creation returns
         constexpr float queuePriority = 1.0F;
         const vk::DeviceQueueCreateInfo queueCreateInfo{
-            .queueFamilyIndex = graphicsQueueFamilyIndex,
+            .queueFamilyIndex = graphicsPresentQueueFamilyIndex,
             .queueCount = 1,
             .pQueuePriorities = &queuePriority,
         };
@@ -312,14 +343,16 @@ private:
             .ppEnabledExtensionNames = requiredDeviceExtensions.data(),
         };
 
-        // Create the logical device, then retrieve queue 0 from the selected graphics family
+        // Create the logical device, then retrieve queue 0 from the selected family
         // The queue is owned by the logical device and is destroyed with it
         device = vk::raii::Device(physicalDevice, createInfo);
-        graphicsQueue = vk::raii::Queue(device, graphicsQueueFamilyIndex, 0);
+        graphicsPresentQueue =
+            vk::raii::Queue(device, graphicsPresentQueueFamilyIndex, 0);
     }
 };
 
-int main() {
+int main()
+{
     try {
         HelloTriangleApplication app;
         app.run();
