@@ -2,6 +2,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
+#include <optional>
 #include <ranges>
 #include <stdexcept>
 #include <string>
@@ -23,6 +24,7 @@ const std::vector validationLayers = {
     "VK_LAYER_KHRONOS_validation"
 };
 
+// Required device extensions for presenting rendered images through a swapchain
 const std::vector requiredDeviceExtensions = {
     vk::KHRSwapchainExtensionName
 };
@@ -48,6 +50,9 @@ private:
     vk::raii::Instance instance = nullptr;
     vk::raii::DebugUtilsMessengerEXT debugMessenger = nullptr;
     vk::raii::PhysicalDevice physicalDevice = nullptr;
+    vk::raii::Device device = nullptr;
+    vk::raii::Queue graphicsQueue = nullptr;
+    uint32_t graphicsQueueFamilyIndex = 0;
 
     void initWindow() {
         glfwInit();
@@ -62,6 +67,7 @@ private:
         createInstance();
         setupDebugMessenger();
         pickPhysicalDevice();
+        createLogicalDevice();
     }
 
     void mainLoop() {
@@ -194,6 +200,7 @@ private:
     }
 
     bool isDeviceSuitable(const vk::raii::PhysicalDevice& device) {
+        // Get the device type, supported API version, limits, and other properties
         const auto properties = device.getProperties();
 
         // Check if the device supports Vulkan 1.3 or higher
@@ -202,14 +209,7 @@ private:
         }
 
         // Check if the device has a graphics queue
-        const auto queueFamilies = device.getQueueFamilyProperties();
-        const bool supportsGraphicsQueue = std::ranges::any_of(
-            queueFamilies,
-            [](const vk::QueueFamilyProperties& queueFamily) {
-                return queueFamily.queueCount > 0 &&
-                       static_cast<bool>(queueFamily.queueFlags & vk::QueueFlagBits::eGraphics);
-            });
-        if (!supportsGraphicsQueue) {
+        if (!findGraphicsQueueFamily(device)) {
             return false;
         }
 
@@ -243,6 +243,7 @@ private:
         return supportsRequiredFeatures;
     }
 
+    // Pick the first physical device that satisfies every required capability
     void pickPhysicalDevice() {
         auto physicalDevices = instance.enumeratePhysicalDevices();
         if (physicalDevices.empty()) {
@@ -260,6 +261,61 @@ private:
         }
 
         physicalDevice = *suitableDevice;
+        graphicsQueueFamilyIndex = findGraphicsQueueFamily(physicalDevice).value();
+    }
+
+    // Find the first queue family that can execute graphics commands
+    std::optional<uint32_t> findGraphicsQueueFamily(const vk::raii::PhysicalDevice& device) const {
+        const auto queueFamilies = device.getQueueFamilyProperties();
+        const auto graphicsQueueFamily = std::ranges::find_if(
+            queueFamilies,
+            [](const vk::QueueFamilyProperties& queueFamily) {
+                return queueFamily.queueCount > 0 &&
+                       static_cast<bool>(queueFamily.queueFlags & vk::QueueFlagBits::eGraphics);
+            });
+
+        if (graphicsQueueFamily == queueFamilies.end()) {
+            return std::nullopt;
+        }
+
+        return static_cast<uint32_t>(std::distance(queueFamilies.begin(), graphicsQueueFamily));
+    }
+
+    void createLogicalDevice() {
+        // Create one graphics queue; priorities must remain valid until device creation returns
+        constexpr float queuePriority = 1.0F;
+        const vk::DeviceQueueCreateInfo queueCreateInfo{
+            .queueFamilyIndex = graphicsQueueFamilyIndex,
+            .queueCount = 1,
+            .pQueuePriorities = &queuePriority,
+        };
+
+        // Enable exactly the same features that were checked during physical device selection
+        vk::StructureChain<
+            vk::PhysicalDeviceFeatures2,
+            vk::PhysicalDeviceVulkan11Features,
+            vk::PhysicalDeviceVulkan13Features,
+            vk::PhysicalDeviceExtendedDynamicStateFeaturesEXT>
+            featureChain{
+                {},                                     // No Vulkan 1.0 features are required yet
+                {.shaderDrawParameters = true},         // Vulkan 1.1 shader draw parameters
+                {.dynamicRendering = true},             // Vulkan 1.3 dynamic rendering
+                {.extendedDynamicState = true},         // Extended dynamic state feature
+            };
+
+        // Device extensions are separate from the instance extensions enabled earlier
+        const vk::DeviceCreateInfo createInfo{
+            .pNext = &featureChain.get<vk::PhysicalDeviceFeatures2>(),
+            .queueCreateInfoCount = 1,
+            .pQueueCreateInfos = &queueCreateInfo,
+            .enabledExtensionCount = static_cast<uint32_t>(requiredDeviceExtensions.size()),
+            .ppEnabledExtensionNames = requiredDeviceExtensions.data(),
+        };
+
+        // Create the logical device, then retrieve queue 0 from the selected graphics family
+        // The queue is owned by the logical device and is destroyed with it
+        device = vk::raii::Device(physicalDevice, createInfo);
+        graphicsQueue = vk::raii::Queue(device, graphicsQueueFamilyIndex, 0);
     }
 };
 
