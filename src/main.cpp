@@ -63,6 +63,7 @@ private:
     std::vector<vk::raii::ImageView> swapChainImageViews;
     vk::SurfaceFormatKHR swapChainSurfaceFormat;
     vk::Extent2D swapChainExtent;
+    vk::raii::PipelineLayout pipelineLayout = nullptr;
 
     void initWindow()
     {
@@ -538,16 +539,14 @@ private:
         constexpr uint32_t spirvMagicNumber = 0x07230203;
         if (code.front() != spirvMagicNumber) {
             throw std::runtime_error(
-                "Shader file does not contain valid SPIR-V: " +
-                filename.string());
+                "Shader file does not contain valid SPIR-V: " + filename.string());
         }
 
         return code;
     }
 
     // Wrap aligned SPIR-V words in a C++ RAII shader module
-    [[nodiscard]] vk::raii::ShaderModule createShaderModule(
-        const std::vector<uint32_t>& code) const
+    [[nodiscard]] vk::raii::ShaderModule createShaderModule(const std::vector<uint32_t>& code) const
     {
         const vk::ShaderModuleCreateInfo createInfo{
             .flags = vk::ShaderModuleCreateFlags{0},
@@ -558,12 +557,11 @@ private:
         return vk::raii::ShaderModule(device, createInfo);
     }
 
-    // Prepare the programmable pipeline stages; fixed-function state follows later
+    // Prepare the programmable and fixed-function graphics pipeline state
     void createGraphicsPipeline()
     {
         const auto shaderCode = readSpirvFile(SHADER_SPIRV_PATH);
-        const vk::raii::ShaderModule shaderModule =
-            createShaderModule(shaderCode);
+        const vk::raii::ShaderModule shaderModule = createShaderModule(shaderCode);
 
         [[maybe_unused]] const std::array shaderStages{
             vk::PipelineShaderStageCreateInfo{
@@ -581,6 +579,100 @@ private:
                 .pSpecializationInfo = nullptr,
             },
         };
+
+        // Viewport and scissor dimensions will be supplied while recording commands
+        constexpr std::array dynamicStates{
+            vk::DynamicState::eViewport,
+            vk::DynamicState::eScissor,
+        };
+        [[maybe_unused]] const vk::PipelineDynamicStateCreateInfo dynamicState{
+            .flags = vk::PipelineDynamicStateCreateFlags{0},
+            .dynamicStateCount = static_cast<uint32_t>(dynamicStates.size()),
+            .pDynamicStates = dynamicStates.data(),
+        };
+
+        // Vertex positions and colors currently come from the vertex shader itself
+        [[maybe_unused]] const vk::PipelineVertexInputStateCreateInfo vertexInputInfo{
+            .flags = vk::PipelineVertexInputStateCreateFlags{0},
+            .vertexBindingDescriptionCount = 0,
+            .pVertexBindingDescriptions = nullptr,
+            .vertexAttributeDescriptionCount = 0,
+            .pVertexAttributeDescriptions = nullptr,
+        };
+
+        // Interpret every three consecutive vertices as an independent triangle
+        [[maybe_unused]] const vk::PipelineInputAssemblyStateCreateInfo inputAssembly{
+            .flags = vk::PipelineInputAssemblyStateCreateFlags{0},
+            .topology = vk::PrimitiveTopology::eTriangleList,
+            .primitiveRestartEnable = vk::False,
+        };
+
+        // The dynamic viewport and scissor still require their counts at creation time
+        [[maybe_unused]] const vk::PipelineViewportStateCreateInfo viewportState{
+            .flags = vk::PipelineViewportStateCreateFlags{0},
+            .viewportCount = 1,
+            .pViewports = nullptr,
+            .scissorCount = 1,
+            .pScissors = nullptr,
+        };
+
+        // Fill clockwise front-facing triangles and cull their back faces
+        [[maybe_unused]] const vk::PipelineRasterizationStateCreateInfo rasterizer{
+            .flags = vk::PipelineRasterizationStateCreateFlags{0},
+            .depthClampEnable = vk::False,
+            .rasterizerDiscardEnable = vk::False,
+            .polygonMode = vk::PolygonMode::eFill,
+            .cullMode = vk::CullModeFlagBits::eBack,
+            .frontFace = vk::FrontFace::eClockwise,
+            .depthBiasEnable = vk::False,
+            .depthBiasConstantFactor = 0.0F,
+            .depthBiasClamp = 0.0F,
+            .depthBiasSlopeFactor = 0.0F,
+            .lineWidth = 1.0F,
+        };
+
+        // Use one sample per pixel; multisample antialiasing is introduced later
+        [[maybe_unused]] const vk::PipelineMultisampleStateCreateInfo multisampling{
+            .flags = vk::PipelineMultisampleStateCreateFlags{0},
+            .rasterizationSamples = vk::SampleCountFlagBits::e1,
+            .sampleShadingEnable = vk::False,
+            .minSampleShading = 1.0F,
+            .pSampleMask = nullptr,
+            .alphaToCoverageEnable = vk::False,
+            .alphaToOneEnable = vk::False,
+        };
+
+        // Write every color channel directly, without alpha or logical blending
+        const vk::PipelineColorBlendAttachmentState colorBlendAttachment{
+            .blendEnable = vk::False,
+            .srcColorBlendFactor = vk::BlendFactor::eOne,
+            .dstColorBlendFactor = vk::BlendFactor::eZero,
+            .colorBlendOp = vk::BlendOp::eAdd,
+            .srcAlphaBlendFactor = vk::BlendFactor::eOne,
+            .dstAlphaBlendFactor = vk::BlendFactor::eZero,
+            .alphaBlendOp = vk::BlendOp::eAdd,
+            .colorWriteMask = vk::ColorComponentFlagBits::eR |
+                              vk::ColorComponentFlagBits::eG |
+                              vk::ColorComponentFlagBits::eB |
+                              vk::ColorComponentFlagBits::eA,
+        };
+        [[maybe_unused]] const vk::PipelineColorBlendStateCreateInfo colorBlending{
+            .flags = vk::PipelineColorBlendStateCreateFlags{0},
+            .logicOpEnable = vk::False,
+            .logicOp = vk::LogicOp::eCopy,
+            .attachmentCount = 1,
+            .pAttachments = &colorBlendAttachment,
+        };
+
+        // No descriptor sets or push constants are used by the current shaders
+        const vk::PipelineLayoutCreateInfo pipelineLayoutInfo{
+            .flags = vk::PipelineLayoutCreateFlags{0},
+            .setLayoutCount = 0,
+            .pSetLayouts = nullptr,
+            .pushConstantRangeCount = 0,
+            .pPushConstantRanges = nullptr,
+        };
+        pipelineLayout = vk::raii::PipelineLayout(device, pipelineLayoutInfo);
     }
 };
 
