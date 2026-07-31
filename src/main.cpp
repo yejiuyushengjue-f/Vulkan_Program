@@ -1,6 +1,9 @@
 #include <algorithm>
+#include <array>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <limits>
 #include <optional>
@@ -80,6 +83,7 @@ private:
         createLogicalDevice();
         createSwapChain();
         createImageViews();
+        createGraphicsPipeline();
     }
 
     void mainLoop()
@@ -372,8 +376,7 @@ private:
     }
 
     // Prefer an sRGB format so colors are interpreted in the expected color space
-    static vk::SurfaceFormatKHR chooseSwapSurfaceFormat(
-        const std::vector<vk::SurfaceFormatKHR>& availableFormats)
+    static vk::SurfaceFormatKHR chooseSwapSurfaceFormat(const std::vector<vk::SurfaceFormatKHR>& availableFormats)
     {
         const auto preferredFormat = std::ranges::find_if(
             availableFormats,
@@ -388,8 +391,7 @@ private:
     }
 
     // Mailbox avoids tearing with low latency; FIFO is guaranteed by Vulkan
-    static vk::PresentModeKHR chooseSwapPresentMode(
-        const std::vector<vk::PresentModeKHR>& availablePresentModes)
+    static vk::PresentModeKHR chooseSwapPresentMode(const std::vector<vk::PresentModeKHR>& availablePresentModes)
     {
         const bool supportsMailbox = std::ranges::any_of(
             availablePresentModes,
@@ -411,27 +413,21 @@ private:
 
         int width = 0;
         int height = 0;
+
+        // Query the window size in pixels by glfw, which may differ from the window size in screen coordinates
         glfwGetFramebufferSize(window, &width, &height);
 
         return {
-            std::clamp(
-                static_cast<uint32_t>(width),
-                capabilities.minImageExtent.width,
-                capabilities.maxImageExtent.width),
-            std::clamp(
-                static_cast<uint32_t>(height),
-                capabilities.minImageExtent.height,
-                capabilities.maxImageExtent.height),
+            std::clamp(static_cast<uint32_t>(width), capabilities.minImageExtent.width, capabilities.maxImageExtent.width),
+            std::clamp(static_cast<uint32_t>(height), capabilities.minImageExtent.height, capabilities.maxImageExtent.height),
         };
     }
 
     // Prefer triple buffering without exceeding the implementation's maximum
-    static uint32_t chooseSwapMinImageCount(
-        const vk::SurfaceCapabilitiesKHR& capabilities)
+    static uint32_t chooseSwapMinImageCount(const vk::SurfaceCapabilitiesKHR& capabilities)
     {
         uint32_t imageCount = std::max(3U, capabilities.minImageCount);
-        if (capabilities.maxImageCount > 0 &&
-            imageCount > capabilities.maxImageCount) {
+        if (capabilities.maxImageCount > 0 && imageCount > capabilities.maxImageCount) {
             imageCount = capabilities.maxImageCount;
         }
 
@@ -443,19 +439,16 @@ private:
     {
         const auto capabilities = physicalDevice.getSurfaceCapabilitiesKHR(*surface);
         const auto availableFormats = physicalDevice.getSurfaceFormatsKHR(*surface);
-        const auto availablePresentModes =
-            physicalDevice.getSurfacePresentModesKHR(*surface);
+        const auto availablePresentModes = physicalDevice.getSurfacePresentModesKHR(*surface);
 
         if (availableFormats.empty() || availablePresentModes.empty()) {
-            throw std::runtime_error(
-                "The selected physical device has incomplete swapchain support!");
+            throw std::runtime_error("The selected physical device has incomplete swapchain support!");
         }
 
         swapChainSurfaceFormat = chooseSwapSurfaceFormat(availableFormats);
         swapChainExtent = chooseSwapExtent(capabilities);
         const uint32_t imageCount = chooseSwapMinImageCount(capabilities);
-        const vk::PresentModeKHR presentMode =
-            chooseSwapPresentMode(availablePresentModes);
+        const vk::PresentModeKHR presentMode = chooseSwapPresentMode(availablePresentModes);
 
         const vk::SwapchainCreateInfoKHR createInfo{
             .flags = vk::SwapchainCreateFlagsKHR{0},
@@ -491,6 +484,7 @@ private:
                 .image = image,
                 .viewType = vk::ImageViewType::e2D,
                 .format = swapChainSurfaceFormat.format,
+                // Use the default mapping of color channels to the image's format
                 .components = {
                     vk::ComponentSwizzle::eIdentity,
                     vk::ComponentSwizzle::eIdentity,
@@ -508,6 +502,85 @@ private:
 
             swapChainImageViews.emplace_back(device, createInfo);
         }
+    }
+
+    // Read SPIR-V into aligned 32-bit words, as required by ShaderModuleCreateInfo
+    static std::vector<uint32_t> readSpirvFile(const std::filesystem::path& filename)
+    {
+        std::ifstream file(filename, std::ios::ate | std::ios::binary);
+        if (!file.is_open()) {
+            throw std::runtime_error(
+                "Failed to open SPIR-V shader: " + filename.string());
+        }
+
+        const std::streampos endPosition = file.tellg();
+        if (endPosition <= std::streampos{0}) {
+            throw std::runtime_error(
+                "SPIR-V shader is empty: " + filename.string());
+        }
+
+        const auto byteCount = static_cast<std::size_t>(endPosition);
+        if (byteCount % sizeof(uint32_t) != 0) {
+            throw std::runtime_error(
+                "SPIR-V shader size is not a multiple of four bytes: " +
+                filename.string());
+        }
+
+        std::vector<uint32_t> code(byteCount / sizeof(uint32_t));
+        file.seekg(0, std::ios::beg);
+        if (!file.read(
+                reinterpret_cast<char*>(code.data()),
+                static_cast<std::streamsize>(byteCount))) {
+            throw std::runtime_error(
+                "Failed to read SPIR-V shader: " + filename.string());
+        }
+
+        constexpr uint32_t spirvMagicNumber = 0x07230203;
+        if (code.front() != spirvMagicNumber) {
+            throw std::runtime_error(
+                "Shader file does not contain valid SPIR-V: " +
+                filename.string());
+        }
+
+        return code;
+    }
+
+    // Wrap aligned SPIR-V words in a C++ RAII shader module
+    [[nodiscard]] vk::raii::ShaderModule createShaderModule(
+        const std::vector<uint32_t>& code) const
+    {
+        const vk::ShaderModuleCreateInfo createInfo{
+            .flags = vk::ShaderModuleCreateFlags{0},
+            .codeSize = code.size() * sizeof(uint32_t),
+            .pCode = code.data(),
+        };
+
+        return vk::raii::ShaderModule(device, createInfo);
+    }
+
+    // Prepare the programmable pipeline stages; fixed-function state follows later
+    void createGraphicsPipeline()
+    {
+        const auto shaderCode = readSpirvFile(SHADER_SPIRV_PATH);
+        const vk::raii::ShaderModule shaderModule =
+            createShaderModule(shaderCode);
+
+        [[maybe_unused]] const std::array shaderStages{
+            vk::PipelineShaderStageCreateInfo{
+                .flags = vk::PipelineShaderStageCreateFlags{0},
+                .stage = vk::ShaderStageFlagBits::eVertex,
+                .module = *shaderModule,
+                .pName = "vertMain",
+                .pSpecializationInfo = nullptr,
+            },
+            vk::PipelineShaderStageCreateInfo{
+                .flags = vk::PipelineShaderStageCreateFlags{0},
+                .stage = vk::ShaderStageFlagBits::eFragment,
+                .module = *shaderModule,
+                .pName = "fragMain",
+                .pSpecializationInfo = nullptr,
+            },
+        };
     }
 };
 

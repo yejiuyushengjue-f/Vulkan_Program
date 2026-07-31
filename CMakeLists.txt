@@ -11,6 +11,13 @@ else()
 endif()
 
 find_package(Vulkan 1.4.335 REQUIRED)
+find_program(SLANGC_EXECUTABLE
+    NAMES slangc slangc.exe
+    HINTS
+        "$ENV{VULKAN_SDK}/Bin"
+        "${Vulkan_INCLUDE_DIR}/../Bin"
+    REQUIRED
+)
 
 set(GLFW_BUILD_DOCS OFF CACHE BOOL "" FORCE)
 set(GLFW_BUILD_TESTS OFF CACHE BOOL "" FORCE)
@@ -49,12 +56,39 @@ else()
 endif()
 
 add_executable(${PROJECT_NAME} src/main.cpp)
+
+set(SHADER_SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/shaders/shader.slang")
+set(SHADER_OUTPUT_DIR "${CMAKE_CURRENT_BINARY_DIR}/shaders")
+set(SHADER_SPIRV "${SHADER_OUTPUT_DIR}/slang.spv")
+
+add_custom_command(
+    OUTPUT "${SHADER_SPIRV}"
+    COMMAND "${CMAKE_COMMAND}" -E make_directory "${SHADER_OUTPUT_DIR}"
+    COMMAND "${SLANGC_EXECUTABLE}"
+        "${SHADER_SOURCE}"
+        -target spirv
+        -profile spirv_1_4
+        -emit-spirv-directly
+        -fvk-use-entrypoint-name
+        -entry vertMain
+        -entry fragMain
+        -o "${SHADER_SPIRV}"
+    DEPENDS "${SHADER_SOURCE}"
+    COMMENT "Compiling Slang shader to SPIR-V"
+    VERBATIM
+)
+
+add_custom_target(compile_shaders DEPENDS "${SHADER_SPIRV}")
+add_dependencies(${PROJECT_NAME} compile_shaders)
 set_target_properties(${PROJECT_NAME} PROPERTIES
     CXX_STANDARD 20
     CXX_STANDARD_REQUIRED ON
     CXX_EXTENSIONS OFF
 )
 
+target_compile_definitions(${PROJECT_NAME} PRIVATE
+    SHADER_SPIRV_PATH="${SHADER_SPIRV}"
+)
 target_link_libraries(${PROJECT_NAME} PRIVATE
     Vulkan::cppm
     glfw
