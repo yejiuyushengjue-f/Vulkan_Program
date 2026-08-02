@@ -10,6 +10,7 @@
 #include <ranges>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 #if defined(__INTELLISENSE__) || !defined(USE_CPP20_MODULES)
@@ -65,6 +66,8 @@ private:
     vk::Extent2D swapChainExtent;
     vk::raii::PipelineLayout pipelineLayout = nullptr;
     vk::raii::Pipeline graphicsPipeline = nullptr;
+    vk::raii::CommandPool commandPool = nullptr;
+    vk::raii::CommandBuffer commandBuffer = nullptr;
 
     void initWindow()
     {
@@ -86,6 +89,8 @@ private:
         createSwapChain();
         createImageViews();
         createGraphicsPipeline();
+        createCommandPool();
+        createCommandBuffer();
     }
 
     void mainLoop()
@@ -281,6 +286,7 @@ private:
         const bool supportsRequiredFeatures =
             features.template get<vk::PhysicalDeviceVulkan11Features>().shaderDrawParameters &&
             features.template get<vk::PhysicalDeviceVulkan13Features>().dynamicRendering &&
+            features.template get<vk::PhysicalDeviceVulkan13Features>().synchronization2 &&
             features.template get<vk::PhysicalDeviceExtendedDynamicStateFeaturesEXT>().extendedDynamicState;
 
         return supportsRequiredFeatures;
@@ -356,7 +362,10 @@ private:
             featureChain{
                 {},                                     // No Vulkan 1.0 features are required yet
                 {.shaderDrawParameters = true},         // Vulkan 1.1 shader draw parameters
-                {.dynamicRendering = true},             // Vulkan 1.3 dynamic rendering
+                {
+                    .synchronization2 = true,           // Vulkan 1.3 synchronization commands
+                    .dynamicRendering = true,           // Vulkan 1.3 dynamic rendering
+                },
                 {.extendedDynamicState = true},         // Extended dynamic state feature
             };
 
@@ -707,6 +716,163 @@ private:
 
         // A pipeline cache is optional; all state above now forms the graphics pipeline
         graphicsPipeline = vk::raii::Pipeline(device, nullptr, pipelineCreateInfoChain.get<vk::GraphicsPipelineCreateInfo>());
+    }
+
+    // Allocate command-buffer storage for the graphics/presentation queue family
+    void createCommandPool()
+    {
+        const vk::CommandPoolCreateInfo poolInfo{
+            .flags = vk::CommandPoolCreateFlagBits::eResetCommandBuffer,
+            .queueFamilyIndex = graphicsPresentQueueFamilyIndex,
+        };
+
+        commandPool = vk::raii::CommandPool(device, poolInfo);
+    }
+
+    // Allocate one primary command buffer; RAII returns it to the pool automatically
+    void createCommandBuffer()
+    {
+        const vk::CommandBufferAllocateInfo allocateInfo{
+            .commandPool = *commandPool,
+            .level = vk::CommandBufferLevel::ePrimary,
+            .commandBufferCount = 1,
+        };
+
+        auto commandBuffers = vk::raii::CommandBuffers(device, allocateInfo);
+        commandBuffer = std::move(commandBuffers.front());
+    }
+
+    // Record a Synchronization2 image-layout transition for one swapchain image
+    void transitionImageLayout(
+        uint32_t imageIndex,
+        vk::ImageLayout oldLayout,
+        vk::ImageLayout newLayout,
+        vk::AccessFlags2 sourceAccessMask,
+        vk::AccessFlags2 destinationAccessMask,
+        vk::PipelineStageFlags2 sourceStageMask,
+        vk::PipelineStageFlags2 destinationStageMask)
+    {
+        const vk::ImageMemoryBarrier2 barrier{
+            .srcStageMask = sourceStageMask,
+            .srcAccessMask = sourceAccessMask,
+            .dstStageMask = destinationStageMask,
+            .dstAccessMask = destinationAccessMask,
+            .oldLayout = oldLayout,
+            .newLayout = newLayout,
+            .srcQueueFamilyIndex = vk::QueueFamilyIgnored,
+            .dstQueueFamilyIndex = vk::QueueFamilyIgnored,
+            .image = swapChainImages.at(imageIndex),
+            .subresourceRange = {
+                .aspectMask = vk::ImageAspectFlagBits::eColor,
+                .baseMipLevel = 0,
+                .levelCount = 1,
+                .baseArrayLayer = 0,
+                .layerCount = 1,
+            },
+        };
+        const vk::DependencyInfo dependencyInfo{
+            .dependencyFlags = vk::DependencyFlags{0},
+            .imageMemoryBarrierCount = 1,
+            .pImageMemoryBarriers = &barrier,
+        };
+
+        commandBuffer.pipelineBarrier2(dependencyInfo);
+    }
+
+    // Record dynamic rendering commands for the acquired swapchain image
+    void recordCommandBuffer(uint32_t imageIndex)
+    {
+        if (imageIndex >= swapChainImages.size()) {
+            throw std::out_of_range("Swapchain image index is out of range!");
+        }
+
+        const vk::CommandBufferBeginInfo beginInfo{
+            .flags = vk::CommandBufferUsageFlags{0},
+            .pInheritanceInfo = nullptr,
+        };
+        commandBuffer.begin(beginInfo);
+
+        // Discard old contents and make the image writable as a color attachment
+        transitionImageLayout(
+            imageIndex,
+            vk::ImageLayout::eUndefined,
+            vk::ImageLayout::eColorAttachmentOptimal,
+            vk::AccessFlags2{0},
+            vk::AccessFlagBits2::eColorAttachmentWrite,
+            vk::PipelineStageFlagBits2::eColorAttachmentOutput,
+            vk::PipelineStageFlagBits2::eColorAttachmentOutput
+        );
+
+        // Clear the color attachment
+        vk::ClearColorValue clearColor;
+        clearColor.setFloat32(std::array{0.0F, 0.0F, 0.0F, 1.0F});
+        vk::ClearValue clearValue;
+        clearValue.setColor(clearColor);
+
+        const vk::RenderingAttachmentInfo colorAttachmentInfo{
+            .imageView = *swapChainImageViews.at(imageIndex),
+            .imageLayout = vk::ImageLayout::eColorAttachmentOptimal,
+            .resolveMode = vk::ResolveModeFlagBits::eNone,
+            .resolveImageView = nullptr,
+            .resolveImageLayout = vk::ImageLayout::eUndefined,
+            .loadOp = vk::AttachmentLoadOp::eClear,
+            .storeOp = vk::AttachmentStoreOp::eStore,
+            .clearValue = clearValue,
+        };
+        const vk::RenderingInfo renderingInfo{
+            .flags = vk::RenderingFlags{0},
+            .renderArea = {
+                .offset = {0, 0},
+                .extent = swapChainExtent,
+            },
+            .layerCount = 1,
+            .viewMask = 0,
+            .colorAttachmentCount = 1,
+            .pColorAttachments = &colorAttachmentInfo,
+            .pDepthAttachment = nullptr,
+            .pStencilAttachment = nullptr,
+        };
+
+        // Begin a dynamic rendering scope, which discards the color attachment contents
+        commandBuffer.beginRendering(renderingInfo);
+        commandBuffer.bindPipeline(vk::PipelineBindPoint::eGraphics, *graphicsPipeline);
+
+        const vk::Viewport viewport{
+            .x = 0.0F,
+            .y = 0.0F,
+            .width = static_cast<float>(swapChainExtent.width),
+            .height = static_cast<float>(swapChainExtent.height),
+            .minDepth = 0.0F,
+            .maxDepth = 1.0F,
+        };
+        const vk::Rect2D scissor{
+            .offset = {0, 0},
+            .extent = swapChainExtent,
+        };
+
+        // Set the dynamic viewport and scissor, then draw a single triangle
+        commandBuffer.setViewport(0, viewport);
+        commandBuffer.setScissor(0, scissor);
+
+        // Draw three vertices, starting with vertex 0, in one instance
+        commandBuffer.draw(3, 1, 0, 0);
+        
+        // End the dynamic rendering scope, which discards the color attachment contents
+        commandBuffer.endRendering();
+
+        // Make the rendered image ready for the presentation engine
+        transitionImageLayout(
+            imageIndex,
+            vk::ImageLayout::eColorAttachmentOptimal,
+            vk::ImageLayout::ePresentSrcKHR,
+            vk::AccessFlagBits2::eColorAttachmentWrite,
+            vk::AccessFlags2{0},
+            vk::PipelineStageFlagBits2::eColorAttachmentOutput,
+            vk::PipelineStageFlagBits2::eBottomOfPipe
+        );
+
+        // End the command buffer recording, which makes it ready for submission
+        commandBuffer.end();
     }
 };
 
