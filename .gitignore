@@ -19,3 +19,6 @@ compile_commands.json
 *.exe
 *.obj
 *.o
+
+# Agent files
+AGENTS.md
