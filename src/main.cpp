@@ -5,6 +5,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <iterator>
 #include <limits>
 #include <optional>
 #include <ranges>
@@ -33,6 +34,8 @@ const std::vector validationLayers = {
 const std::vector requiredDeviceExtensions = {
     vk::KHRSwapchainExtensionName
 };
+
+constexpr uint32_t MAX_FRAMES_IN_FLIGHT = 2;
 
 #ifdef NDEBUG
 constexpr bool enableValidationLayers = false;
@@ -67,10 +70,11 @@ private:
     vk::raii::PipelineLayout pipelineLayout = nullptr;
     vk::raii::Pipeline graphicsPipeline = nullptr;
     vk::raii::CommandPool commandPool = nullptr;
-    vk::raii::CommandBuffer commandBuffer = nullptr;
-    vk::raii::Semaphore presentCompleteSemaphore = nullptr;
+    std::vector<vk::raii::CommandBuffer> commandBuffers;
+    std::vector<vk::raii::Semaphore> presentCompleteSemaphores;
     std::vector<vk::raii::Semaphore> renderFinishedSemaphores;
-    vk::raii::Fence drawFence = nullptr;
+    std::vector<vk::raii::Fence> drawFences;
+    uint32_t currentFrame = 0;
 
     void initWindow()
     {
@@ -93,7 +97,7 @@ private:
         createImageViews();
         createGraphicsPipeline();
         createCommandPool();
-        createCommandBuffer();
+        createCommandBuffers();
         createSyncObjects();
     }
 
@@ -735,21 +739,21 @@ private:
         commandPool = vk::raii::CommandPool(device, poolInfo);
     }
 
-    // Allocate one primary command buffer; RAII returns it to the pool automatically
-    void createCommandBuffer()
+    // Allocate one independently recordable primary command buffer per in-flight frame
+    void createCommandBuffers()
     {
         const vk::CommandBufferAllocateInfo allocateInfo{
             .commandPool = *commandPool,
             .level = vk::CommandBufferLevel::ePrimary,
-            .commandBufferCount = 1,
+            .commandBufferCount = MAX_FRAMES_IN_FLIGHT,
         };
 
-        auto commandBuffers = vk::raii::CommandBuffers(device, allocateInfo);
-        commandBuffer = std::move(commandBuffers.front());
+        commandBuffers = vk::raii::CommandBuffers(device, allocateInfo);
     }
 
     // Record a Synchronization2 image-layout transition for one swapchain image
     void transitionImageLayout(
+        vk::raii::CommandBuffer& commandBuffer,
         uint32_t imageIndex,
         vk::ImageLayout oldLayout,
         vk::ImageLayout newLayout,
@@ -786,7 +790,7 @@ private:
     }
 
     // Record dynamic rendering commands for the acquired swapchain image
-    void recordCommandBuffer(uint32_t imageIndex)
+    void recordCommandBuffer(vk::raii::CommandBuffer& commandBuffer, uint32_t imageIndex)
     {
         if (imageIndex >= swapChainImages.size()) {
             throw std::out_of_range("Swapchain image index is out of range!");
@@ -800,6 +804,7 @@ private:
 
         // Discard old contents and make the image writable as a color attachment
         transitionImageLayout(
+            commandBuffer,
             imageIndex,
             vk::ImageLayout::eUndefined,
             vk::ImageLayout::eColorAttachmentOptimal,
@@ -839,7 +844,7 @@ private:
             .pStencilAttachment = nullptr,
         };
 
-        // Begin a dynamic rendering scope, which discards the color attachment contents
+        // Begin a dynamic rendering scope and clear the attachment
         commandBuffer.beginRendering(renderingInfo);
         commandBuffer.bindPipeline(vk::PipelineBindPoint::eGraphics, *graphicsPipeline);
 
@@ -859,15 +864,14 @@ private:
         // Set the dynamic viewport and scissor, then draw a single triangle
         commandBuffer.setViewport(0, viewport);
         commandBuffer.setScissor(0, scissor);
-
-        // Draw three vertices, starting with vertex 0, in one instance
         commandBuffer.draw(3, 1, 0, 0);
-        
+
         // End the dynamic rendering scope and retain the rendered attachment contents
         commandBuffer.endRendering();
 
         // Make the rendered image ready for the presentation engine
         transitionImageLayout(
+            commandBuffer,
             imageIndex,
             vk::ImageLayout::eColorAttachmentOptimal,
             vk::ImageLayout::ePresentSrcKHR,
@@ -877,13 +881,19 @@ private:
             vk::PipelineStageFlagBits2::eBottomOfPipe
         );
 
-        // End the command buffer recording, which makes it ready for submission
+        // End recording so this frame's command buffer is ready for submission
         commandBuffer.end();
     }
 
-    // Create the synchronization objects used by our single frame in flight
+    // Frame resources use currentFrame; presentation semaphores use swapchain imageIndex
     void createSyncObjects()
     {
+        if (!presentCompleteSemaphores.empty() ||
+            !renderFinishedSemaphores.empty() ||
+            !drawFences.empty()) {
+            throw std::logic_error("Synchronization objects have already been created!");
+        }
+
         const vk::SemaphoreCreateInfo semaphoreInfo{
             .flags = vk::SemaphoreCreateFlags{0},
         };
@@ -891,25 +901,49 @@ private:
             .flags = vk::FenceCreateFlagBits::eSignaled,
         };
 
-        presentCompleteSemaphore = vk::raii::Semaphore(device, semaphoreInfo);
-        renderFinishedSemaphores.clear();
+        presentCompleteSemaphores.reserve(MAX_FRAMES_IN_FLIGHT);
+        drawFences.reserve(MAX_FRAMES_IN_FLIGHT);
         renderFinishedSemaphores.reserve(swapChainImages.size());
-        for (std::size_t imageIndex = 0; imageIndex < swapChainImages.size(); ++imageIndex) {
-            renderFinishedSemaphores.emplace_back(device, semaphoreInfo);
-        }
-        drawFence = vk::raii::Fence(device, fenceInfo);
+
+        std::ranges::generate_n(
+            std::back_inserter(renderFinishedSemaphores),
+            swapChainImages.size(),
+            [this, &semaphoreInfo] {
+                return vk::raii::Semaphore(device, semaphoreInfo);
+            });
+        std::ranges::generate_n(
+            std::back_inserter(presentCompleteSemaphores),
+            MAX_FRAMES_IN_FLIGHT,
+            [this, &semaphoreInfo] {
+                return vk::raii::Semaphore(device, semaphoreInfo);
+            });
+        std::ranges::generate_n(
+            std::back_inserter(drawFences),
+            MAX_FRAMES_IN_FLIGHT,
+            [this, &fenceInfo] {
+                return vk::raii::Fence(device, fenceInfo);
+            });
     }
 
     void drawFrame()
     {
-        // Wait until the previous submission no longer uses our command buffer or semaphores
-        const vk::Result fenceResult = device.waitForFences(*drawFence, vk::True, std::numeric_limits<uint64_t>::max());
+        auto& commandBuffer = commandBuffers.at(currentFrame);
+        auto& presentCompleteSemaphore = presentCompleteSemaphores.at(currentFrame);
+        auto& drawFence = drawFences.at(currentFrame);
+
+        // Wait only when cycling back to resources belonging to this in-flight frame
+        const vk::Result fenceResult = device.waitForFences(
+            *drawFence,
+            vk::True,
+            std::numeric_limits<uint64_t>::max());
         if (fenceResult != vk::Result::eSuccess) {
             throw std::runtime_error("Failed to wait for the draw fence!");
         }
 
-        // Signal the binary semaphore when a swapchain image becomes available
-        const vk::ResultValue<uint32_t> acquireResult = swapChain.acquireNextImage(std::numeric_limits<uint64_t>::max(), *presentCompleteSemaphore, nullptr);
+        // Signal this frame's binary semaphore when an image becomes available
+        const vk::ResultValue<uint32_t> acquireResult = swapChain.acquireNextImage(
+            std::numeric_limits<uint64_t>::max(),
+            *presentCompleteSemaphore, nullptr);
 
         if (acquireResult.result != vk::Result::eSuccess && acquireResult.result != vk::Result::eSuboptimalKHR) {
             throw std::runtime_error("Failed to acquire next swapchain image!");
@@ -918,10 +952,11 @@ private:
         const uint32_t imageIndex = acquireResult.value;
         const vk::Semaphore renderFinishedSemaphore = *renderFinishedSemaphores.at(imageIndex);
 
-        // Record commands for the acquired swapchain image
-        recordCommandBuffer(imageIndex);
+        // This frame's command buffer is idle now and can be reset and rerecorded
+        commandBuffer.reset();
+        recordCommandBuffer(commandBuffer, imageIndex);
 
-        // Wait for image acquisition before color output, then signal after all commands
+        // Wait for acquisition before color output, then signal after all commands
         const vk::SemaphoreSubmitInfo waitSemaphoreInfo{
             .semaphore = *presentCompleteSemaphore,
             .value = 0,
@@ -952,7 +987,7 @@ private:
         device.resetFences(*drawFence);
         graphicsPresentQueue.submit2(submitInfo, *drawFence);
 
-        // Presentation waits until rendering and the transition to PresentSrc have finished
+        // Presentation waits on the semaphore associated with this swapchain image
         const vk::PresentInfoKHR presentInfo{
             .waitSemaphoreCount = 1,
             .pWaitSemaphores = &renderFinishedSemaphore,
@@ -966,6 +1001,8 @@ private:
         if (presentResult != vk::Result::eSuccess && presentResult != vk::Result::eSuboptimalKHR) {
             throw std::runtime_error("Failed to present the swapchain image!");
         }
+
+        currentFrame = (currentFrame + 1) % MAX_FRAMES_IN_FLIGHT;
     }
 };
 
