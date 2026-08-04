@@ -75,15 +75,18 @@ private:
     std::vector<vk::raii::Semaphore> renderFinishedSemaphores;
     std::vector<vk::raii::Fence> drawFences;
     uint32_t currentFrame = 0;
+    bool framebufferResized = false;
 
     void initWindow()
     {
         glfwInit();
 
         glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
-        glfwWindowHint(GLFW_RESIZABLE, GLFW_FALSE);
+        glfwWindowHint(GLFW_RESIZABLE, GLFW_TRUE);
 
         window = glfwCreateWindow(WIDTH, HEIGHT, "Vulkan", nullptr, nullptr);
+        glfwSetWindowUserPointer(window, this);
+        glfwSetFramebufferSizeCallback(window, framebufferResizeCallback);
     }
 
     void initVulkan()
@@ -114,6 +117,8 @@ private:
 
     void cleanup()
     {
+        cleanupSwapChain();
+
         glfwDestroyWindow(window);
         glfwTerminate();
     }
@@ -903,14 +908,8 @@ private:
 
         presentCompleteSemaphores.reserve(MAX_FRAMES_IN_FLIGHT);
         drawFences.reserve(MAX_FRAMES_IN_FLIGHT);
-        renderFinishedSemaphores.reserve(swapChainImages.size());
+        createRenderFinishedSemaphores();
 
-        std::ranges::generate_n(
-            std::back_inserter(renderFinishedSemaphores),
-            swapChainImages.size(),
-            [this, &semaphoreInfo] {
-                return vk::raii::Semaphore(device, semaphoreInfo);
-            });
         std::ranges::generate_n(
             std::back_inserter(presentCompleteSemaphores),
             MAX_FRAMES_IN_FLIGHT,
@@ -925,6 +924,25 @@ private:
             });
     }
 
+    // Present wait semaphores are indexed by swapchain image and must be recreated with it
+    void createRenderFinishedSemaphores()
+    {
+        if (!renderFinishedSemaphores.empty()) {
+            throw std::logic_error("Render-finished semaphores have already been created!");
+        }
+
+        const vk::SemaphoreCreateInfo semaphoreInfo{
+            .flags = vk::SemaphoreCreateFlags{0},
+        };
+        renderFinishedSemaphores.reserve(swapChainImages.size());
+        std::ranges::generate_n(
+            std::back_inserter(renderFinishedSemaphores),
+            swapChainImages.size(),
+            [this, &semaphoreInfo] {
+                return vk::raii::Semaphore(device, semaphoreInfo);
+            });
+    }
+
     void drawFrame()
     {
         auto& commandBuffer = commandBuffers.at(currentFrame);
@@ -932,10 +950,7 @@ private:
         auto& drawFence = drawFences.at(currentFrame);
 
         // Wait only when cycling back to resources belonging to this in-flight frame
-        const vk::Result fenceResult = device.waitForFences(
-            *drawFence,
-            vk::True,
-            std::numeric_limits<uint64_t>::max());
+        const vk::Result fenceResult = device.waitForFences(*drawFence, vk::True, std::numeric_limits<uint64_t>::max());
         if (fenceResult != vk::Result::eSuccess) {
             throw std::runtime_error("Failed to wait for the draw fence!");
         }
@@ -943,8 +958,13 @@ private:
         // Signal this frame's binary semaphore when an image becomes available
         const vk::ResultValue<uint32_t> acquireResult = swapChain.acquireNextImage(
             std::numeric_limits<uint64_t>::max(),
-            *presentCompleteSemaphore, nullptr);
+            *presentCompleteSemaphore, nullptr
+        );
 
+        if (acquireResult.result == vk::Result::eErrorOutOfDateKHR) {
+            recreateSwapChain();
+            return;
+        }
         if (acquireResult.result != vk::Result::eSuccess && acquireResult.result != vk::Result::eSuboptimalKHR) {
             throw std::runtime_error("Failed to acquire next swapchain image!");
         }
@@ -998,11 +1018,55 @@ private:
         };
 
         const vk::Result presentResult = graphicsPresentQueue.presentKHR(presentInfo);
-        if (presentResult != vk::Result::eSuccess && presentResult != vk::Result::eSuboptimalKHR) {
+        if (presentResult == vk::Result::eErrorOutOfDateKHR || presentResult == vk::Result::eSuboptimalKHR || framebufferResized) {
+            framebufferResized = false;
+            recreateSwapChain();
+        } else if (presentResult != vk::Result::eSuccess) {
             throw std::runtime_error("Failed to present the swapchain image!");
         }
 
         currentFrame = (currentFrame + 1) % MAX_FRAMES_IN_FLIGHT;
+    }
+
+    void cleanupSwapChain()
+    {
+        // The pipeline bakes in the dynamic-rendering color attachment format
+        graphicsPipeline = nullptr;
+        pipelineLayout = nullptr;
+        renderFinishedSemaphores.clear();
+        swapChainImageViews.clear();
+        swapChainImages.clear();
+        swapChain = nullptr;
+    }
+
+    void recreateSwapChain()
+    {
+        int width = 0;
+        int height = 0;
+        glfwGetFramebufferSize(window, &width, &height);
+        while (width == 0 || height == 0) {
+            glfwWaitEvents();
+            if (glfwWindowShouldClose(window)) {
+                return;
+            }
+            glfwGetFramebufferSize(window, &width, &height);
+        }
+
+        device.waitIdle();
+
+        cleanupSwapChain();
+
+        createSwapChain();
+        createImageViews();
+        createGraphicsPipeline();
+        createRenderFinishedSemaphores();
+        framebufferResized = false;
+    }
+
+    static void framebufferResizeCallback(GLFWwindow* window, int, int)
+    {
+        auto app = reinterpret_cast<HelloTriangleApplication*>(glfwGetWindowUserPointer(window));
+        app->framebufferResized = true;
     }
 };
 

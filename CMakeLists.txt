@@ -33,6 +33,7 @@ if(ENABLE_CPP20_MODULE)
 
     target_compile_definitions(VulkanCppModule PUBLIC
         VULKAN_HPP_DISPATCH_LOADER_DYNAMIC=1
+        VULKAN_HPP_HANDLE_ERROR_OUT_OF_DATE_AS_SUCCESS=1
         VULKAN_HPP_NO_STRUCT_CONSTRUCTORS=1
     )
     target_include_directories(VulkanCppModule PUBLIC "${Vulkan_INCLUDE_DIR}")
@@ -51,6 +52,7 @@ else()
     target_link_libraries(VulkanCppModule INTERFACE Vulkan::Vulkan)
     target_compile_definitions(VulkanCppModule INTERFACE
         VULKAN_HPP_DISPATCH_LOADER_DYNAMIC=1
+        VULKAN_HPP_HANDLE_ERROR_OUT_OF_DATE_AS_SUCCESS=1
         VULKAN_HPP_NO_STRUCT_CONSTRUCTORS=1
     )
 endif()
