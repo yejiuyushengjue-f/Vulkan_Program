@@ -22,8 +22,8 @@ import vulkan_hpp;
 #define GLFW_INCLUDE_VULKAN
 #include <GLFW/glfw3.h>
 
-constexpr uint32_t WIDTH = 800;
-constexpr uint32_t HEIGHT = 600;
+constexpr uint32_t WIDTH = 1600;
+constexpr uint32_t HEIGHT = 1200;
 
 const std::vector validationLayers = {
     "VK_LAYER_KHRONOS_validation"
@@ -68,6 +68,9 @@ private:
     vk::raii::Pipeline graphicsPipeline = nullptr;
     vk::raii::CommandPool commandPool = nullptr;
     vk::raii::CommandBuffer commandBuffer = nullptr;
+    vk::raii::Semaphore presentCompleteSemaphore = nullptr;
+    std::vector<vk::raii::Semaphore> renderFinishedSemaphores;
+    vk::raii::Fence drawFence = nullptr;
 
     void initWindow()
     {
@@ -91,13 +94,18 @@ private:
         createGraphicsPipeline();
         createCommandPool();
         createCommandBuffer();
+        createSyncObjects();
     }
 
     void mainLoop()
     {
         while (!glfwWindowShouldClose(window)) {
             glfwPollEvents();
+            drawFrame();
         }
+
+        // Presentation is asynchronous, so all device work must finish before cleanup
+        device.waitIdle();
     }
 
     void cleanup()
@@ -311,8 +319,7 @@ private:
         }
 
         physicalDevice = *suitableDevice;
-        graphicsPresentQueueFamilyIndex =
-            findGraphicsAndPresentQueueFamily(physicalDevice).value();
+        graphicsPresentQueueFamilyIndex = findGraphicsAndPresentQueueFamily(physicalDevice).value();
     }
 
     // Find the first queue family that can both draw and present to this window surface
@@ -382,8 +389,7 @@ private:
         // Create the logical device, then retrieve queue 0 from the selected family
         // The queue is owned by the logical device and is destroyed with it
         device = vk::raii::Device(physicalDevice, createInfo);
-        graphicsPresentQueue =
-            vk::raii::Queue(device, graphicsPresentQueueFamilyIndex, 0);
+        graphicsPresentQueue = vk::raii::Queue(device, graphicsPresentQueueFamilyIndex, 0);
     }
 
     // Prefer an sRGB format so colors are interpreted in the expected color space
@@ -857,7 +863,7 @@ private:
         // Draw three vertices, starting with vertex 0, in one instance
         commandBuffer.draw(3, 1, 0, 0);
         
-        // End the dynamic rendering scope, which discards the color attachment contents
+        // End the dynamic rendering scope and retain the rendered attachment contents
         commandBuffer.endRendering();
 
         // Make the rendered image ready for the presentation engine
@@ -873,6 +879,93 @@ private:
 
         // End the command buffer recording, which makes it ready for submission
         commandBuffer.end();
+    }
+
+    // Create the synchronization objects used by our single frame in flight
+    void createSyncObjects()
+    {
+        const vk::SemaphoreCreateInfo semaphoreInfo{
+            .flags = vk::SemaphoreCreateFlags{0},
+        };
+        const vk::FenceCreateInfo fenceInfo{
+            .flags = vk::FenceCreateFlagBits::eSignaled,
+        };
+
+        presentCompleteSemaphore = vk::raii::Semaphore(device, semaphoreInfo);
+        renderFinishedSemaphores.clear();
+        renderFinishedSemaphores.reserve(swapChainImages.size());
+        for (std::size_t imageIndex = 0; imageIndex < swapChainImages.size(); ++imageIndex) {
+            renderFinishedSemaphores.emplace_back(device, semaphoreInfo);
+        }
+        drawFence = vk::raii::Fence(device, fenceInfo);
+    }
+
+    void drawFrame()
+    {
+        // Wait until the previous submission no longer uses our command buffer or semaphores
+        const vk::Result fenceResult = device.waitForFences(*drawFence, vk::True, std::numeric_limits<uint64_t>::max());
+        if (fenceResult != vk::Result::eSuccess) {
+            throw std::runtime_error("Failed to wait for the draw fence!");
+        }
+
+        // Signal the binary semaphore when a swapchain image becomes available
+        const vk::ResultValue<uint32_t> acquireResult = swapChain.acquireNextImage(std::numeric_limits<uint64_t>::max(), *presentCompleteSemaphore, nullptr);
+
+        if (acquireResult.result != vk::Result::eSuccess && acquireResult.result != vk::Result::eSuboptimalKHR) {
+            throw std::runtime_error("Failed to acquire next swapchain image!");
+        }
+
+        const uint32_t imageIndex = acquireResult.value;
+        const vk::Semaphore renderFinishedSemaphore = *renderFinishedSemaphores.at(imageIndex);
+
+        // Record commands for the acquired swapchain image
+        recordCommandBuffer(imageIndex);
+
+        // Wait for image acquisition before color output, then signal after all commands
+        const vk::SemaphoreSubmitInfo waitSemaphoreInfo{
+            .semaphore = *presentCompleteSemaphore,
+            .value = 0,
+            .stageMask = vk::PipelineStageFlagBits2::eColorAttachmentOutput,
+            .deviceIndex = 0,
+        };
+        const vk::CommandBufferSubmitInfo commandBufferInfo{
+            .commandBuffer = *commandBuffer,
+            .deviceMask = 1,
+        };
+        const vk::SemaphoreSubmitInfo signalSemaphoreInfo{
+            .semaphore = renderFinishedSemaphore,
+            .value = 0,
+            .stageMask = vk::PipelineStageFlagBits2::eAllCommands,
+            .deviceIndex = 0,
+        };
+        const vk::SubmitInfo2 submitInfo{
+            .flags = vk::SubmitFlags{0},
+            .waitSemaphoreInfoCount = 1,
+            .pWaitSemaphoreInfos = &waitSemaphoreInfo,
+            .commandBufferInfoCount = 1,
+            .pCommandBufferInfos = &commandBufferInfo,
+            .signalSemaphoreInfoCount = 1,
+            .pSignalSemaphoreInfos = &signalSemaphoreInfo,
+        };
+
+        // Reset only when a successful acquire guarantees that this frame will be submitted
+        device.resetFences(*drawFence);
+        graphicsPresentQueue.submit2(submitInfo, *drawFence);
+
+        // Presentation waits until rendering and the transition to PresentSrc have finished
+        const vk::PresentInfoKHR presentInfo{
+            .waitSemaphoreCount = 1,
+            .pWaitSemaphores = &renderFinishedSemaphore,
+            .swapchainCount = 1,
+            .pSwapchains = &*swapChain,
+            .pImageIndices = &imageIndex,
+            .pResults = nullptr,
+        };
+
+        const vk::Result presentResult = graphicsPresentQueue.presentKHR(presentInfo);
+        if (presentResult != vk::Result::eSuccess && presentResult != vk::Result::eSuboptimalKHR) {
+            throw std::runtime_error("Failed to present the swapchain image!");
+        }
     }
 };
 
