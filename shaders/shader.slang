@@ -1,31 +1,24 @@
-static float2 positions[3] = float2[](
-    float2(0.0, -0.5),
-    float2(0.5, 0.5),
-    float2(-0.5, 0.5)
-);
+struct VSinput {
+    float2 inPosition;
+    float3 inColor;
+};
 
-static float3 colors[3] = float3[](
-    float3(1.0, 0.0, 0.0),
-    float3(0.0, 1.0, 0.0),
-    float3(0.0, 0.0, 1.0)
-);
-
-struct V2F {
+struct VSoutput {
+    float4 pos : SV_Position;
     float3 color;
-    float4 sv_position : SV_Position;
 };
 
 [shader("vertex")]
-V2F vertMain(uint vertexId : SV_VertexID)
+VSoutput vertMain(VSinput input)
 {
-    V2F output;
-    output.sv_position = float4(positions[vertexId], 0.0, 1.0);
-    output.color = colors[vertexId];
+    VSoutput output;
+    output.pos = float4(input.inPosition, 0.0, 1.0);
+    output.color = input.inColor;
     return output;
 }
 
 [shader("fragment")]
-float4 fragMain(V2F input) : SV_Target
+float4 fragMain(VSoutput input) : SV_Target
 {
     return float4(input.color, 1.0);
 }

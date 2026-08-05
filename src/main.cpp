@@ -1,5 +1,6 @@
 #include <algorithm>
 #include <array>
+#include <cstddef>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
@@ -13,6 +14,8 @@
 #include <string>
 #include <utility>
 #include <vector>
+
+#include <glm/glm.hpp>
 
 #if defined(__INTELLISENSE__) || !defined(USE_CPP20_MODULES)
 #include <vulkan/vulkan_raii.hpp>
@@ -42,6 +45,46 @@ constexpr bool enableValidationLayers = false;
 #else
 constexpr bool enableValidationLayers = true;
 #endif
+
+struct Vertex {
+    glm::vec2 pos;
+    glm::vec3 color;
+
+    // One Vertex object is consumed for each vertex from binding 0.
+    [[nodiscard]] static constexpr vk::VertexInputBindingDescription getBindingDescription() noexcept
+    {
+        return {.binding = 0,
+                .stride = sizeof(Vertex),
+                .inputRate = vk::VertexInputRate::eVertex};
+    }
+
+    // Match Vertex::pos/color with the shader's locations 0 and 1.
+    [[nodiscard]] static constexpr std::array<vk::VertexInputAttributeDescription, 2>
+    getAttributeDescriptions() noexcept
+    {
+        return {{
+            vk::VertexInputAttributeDescription{
+                .location = 0,
+                .binding = 0,
+                .format = vk::Format::eR32G32Sfloat,
+                .offset = offsetof(Vertex, pos),
+            },
+            vk::VertexInputAttributeDescription{
+                .location = 1,
+                .binding = 0,
+                .format = vk::Format::eR32G32B32Sfloat,
+                .offset = offsetof(Vertex, color),
+            },
+        }};
+    }
+};
+
+// The next tutorial chapter uploads these vertices to a GPU vertex buffer.
+const std::array<Vertex, 3> vertices{{
+    Vertex{{ 0.0F, -0.5F}, {1.0F, 0.0F, 0.0F}},
+    Vertex{{ 0.5F,  0.5F}, {0.0F, 1.0F, 0.0F}},
+    Vertex{{-0.5F,  0.5F}, {0.0F, 0.0F, 1.0F}},
+}};
 
 class HelloTriangleApplication {
 public:
@@ -616,13 +659,15 @@ private:
             .pDynamicStates = dynamicStates.data(),
         };
 
-        // Vertex positions and colors currently come from the vertex shader itself
+        // Describe how the fixed Vertex layout is read by the vertex shader.
+        constexpr auto bindingDescription = Vertex::getBindingDescription();
+        constexpr auto attributeDescriptions = Vertex::getAttributeDescriptions();
         const vk::PipelineVertexInputStateCreateInfo vertexInputInfo{
             .flags = vk::PipelineVertexInputStateCreateFlags{0},
-            .vertexBindingDescriptionCount = 0,
-            .pVertexBindingDescriptions = nullptr,
-            .vertexAttributeDescriptionCount = 0,
-            .pVertexAttributeDescriptions = nullptr,
+            .vertexBindingDescriptionCount = 1,
+            .pVertexBindingDescriptions = &bindingDescription,
+            .vertexAttributeDescriptionCount = static_cast<uint32_t>(attributeDescriptions.size()),
+            .pVertexAttributeDescriptions = attributeDescriptions.data(),
         };
 
         // Interpret every three consecutive vertices as an independent triangle
