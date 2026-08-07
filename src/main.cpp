@@ -81,7 +81,7 @@ struct Vertex {
 
 // The next tutorial chapter uploads these vertices to a GPU vertex buffer.
 const std::array<Vertex, 3> vertices{{
-    Vertex{{ 0.0F, -0.5F}, {1.0F, 0.0F, 0.0F}},
+    Vertex{{ 0.0F, -0.5F}, {1.0F, 1.0F, 1.0F}},
     Vertex{{ 0.5F,  0.5F}, {0.0F, 1.0F, 0.0F}},
     Vertex{{-0.5F,  0.5F}, {0.0F, 0.0F, 1.0F}},
 }};
@@ -119,6 +119,10 @@ private:
     std::vector<vk::raii::Fence> drawFences;
     uint32_t currentFrame = 0;
     bool framebufferResized = false;
+    // Declare memory before the buffer so reverse-order RAII destruction releases
+    // the buffer before freeing the memory bound to it.
+    vk::raii::DeviceMemory vertexBufferMemory = nullptr;
+    vk::raii::Buffer vertexBuffer = nullptr;
 
     void initWindow()
     {
@@ -143,6 +147,7 @@ private:
         createImageViews();
         createGraphicsPipeline();
         createCommandPool();
+        createVertexBuffer();
         createCommandBuffers();
         createSyncObjects();
     }
@@ -898,6 +903,11 @@ private:
         commandBuffer.beginRendering(renderingInfo);
         commandBuffer.bindPipeline(vk::PipelineBindPoint::eGraphics, *graphicsPipeline);
 
+        // Binding 0 corresponds to Vertex::getBindingDescription().
+        const std::array vertexBuffers{*vertexBuffer};
+        constexpr std::array<vk::DeviceSize, 1> vertexBufferOffsets{0};
+        commandBuffer.bindVertexBuffers(0, vertexBuffers, vertexBufferOffsets);
+
         const vk::Viewport viewport{
             .x = 0.0F,
             .y = 0.0F,
@@ -914,7 +924,7 @@ private:
         // Set the dynamic viewport and scissor, then draw a single triangle
         commandBuffer.setViewport(0, viewport);
         commandBuffer.setScissor(0, scissor);
-        commandBuffer.draw(3, 1, 0, 0);
+        commandBuffer.draw(static_cast<uint32_t>(vertices.size()), 1, 0, 0);
 
         // End the dynamic rendering scope and retain the rendered attachment contents
         commandBuffer.endRendering();
@@ -1112,6 +1122,56 @@ private:
     {
         auto app = reinterpret_cast<HelloTriangleApplication*>(glfwGetWindowUserPointer(window));
         app->framebufferResized = true;
+    }
+
+    [[nodiscard]] uint32_t findMemoryType(uint32_t typeFilter, vk::MemoryPropertyFlags requiredProperties) const
+    {
+        const vk::PhysicalDeviceMemoryProperties memoryProperties = physicalDevice.getMemoryProperties();
+        const auto memoryTypeIndices = std::views::iota(uint32_t{0}, memoryProperties.memoryTypeCount);
+
+        const auto memoryTypeIt = std::ranges::find_if(
+            memoryTypeIndices,
+            [&](uint32_t index) {
+                const bool supportedByBuffer = (typeFilter & (uint32_t{1} << index)) != 0;
+                const vk::MemoryPropertyFlags availableProperties = memoryProperties.memoryTypes[index].propertyFlags;
+                return supportedByBuffer && (availableProperties & requiredProperties) == requiredProperties;
+            });
+
+        if (memoryTypeIt == memoryTypeIndices.end()) {
+            throw std::runtime_error("failed to find suitable memory type!");
+        }
+
+        return *memoryTypeIt;
+    }
+
+    void createVertexBuffer()
+    {
+        const vk::DeviceSize bufferSize = sizeof(vertices[0]) * vertices.size();
+        const vk::BufferCreateInfo bufferInfo{
+            .flags = vk::BufferCreateFlags{0},
+            .size = bufferSize,
+            .usage = vk::BufferUsageFlagBits::eVertexBuffer,
+            .sharingMode = vk::SharingMode::eExclusive,
+            .queueFamilyIndexCount = 0,
+            .pQueueFamilyIndices = nullptr,
+        };
+
+        vertexBuffer = vk::raii::Buffer(device, bufferInfo);
+
+        const vk::MemoryRequirements memoryRequirements = vertexBuffer.getMemoryRequirements();
+        const vk::MemoryPropertyFlags hostMemoryProperties = vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent;
+        const vk::MemoryAllocateInfo allocateInfo{
+            .allocationSize = memoryRequirements.size,
+            .memoryTypeIndex = findMemoryType(memoryRequirements.memoryTypeBits, hostMemoryProperties),
+        };
+
+        vertexBufferMemory = vk::raii::DeviceMemory(device, allocateInfo);
+        vertexBuffer.bindMemory(*vertexBufferMemory, 0);
+
+        // Host-coherent memory makes the copied vertex data visible without an explicit flushMappedMemoryRanges call.
+        void* mappedMemory = vertexBufferMemory.mapMemory(0, bufferSize);
+        std::memcpy(mappedMemory, vertices.data(), static_cast<std::size_t>(bufferSize));
+        vertexBufferMemory.unmapMemory();
     }
 };
 
