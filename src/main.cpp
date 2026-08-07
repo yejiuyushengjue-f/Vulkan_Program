@@ -79,12 +79,16 @@ struct Vertex {
     }
 };
 
-// The next tutorial chapter uploads these vertices to a GPU vertex buffer.
-const std::array<Vertex, 3> vertices{{
-    Vertex{{ 0.0F, -0.5F}, {1.0F, 1.0F, 1.0F}},
-    Vertex{{ 0.5F,  0.5F}, {0.0F, 1.0F, 0.0F}},
-    Vertex{{-0.5F,  0.5F}, {0.0F, 0.0F, 1.0F}},
-}};
+const std::vector<Vertex> vertices = {
+    {{-0.5f, -0.5f}, {1.0f, 0.0f, 0.0f}},
+    {{0.5f, -0.5f}, {0.0f, 1.0f, 0.0f}},
+    {{0.5f, 0.5f}, {0.0f, 0.0f, 1.0f}},
+    {{-0.5f, 0.5f}, {1.0f, 1.0f, 1.0f}}
+};
+
+const std::vector<uint16_t> indices = {
+    0, 1, 2, 2, 3, 0
+};
 
 class HelloTriangleApplication {
 public:
@@ -132,6 +136,8 @@ private:
     // the buffer before freeing the memory bound to it.
     vk::raii::DeviceMemory vertexBufferMemory = nullptr;
     vk::raii::Buffer vertexBuffer = nullptr;
+    vk::raii::DeviceMemory indexBufferMemory = nullptr;
+    vk::raii::Buffer indexBuffer = nullptr;
 
     void initWindow()
     {
@@ -157,6 +163,7 @@ private:
         createGraphicsPipeline();
         createCommandPools();
         createVertexBuffer();
+        createIndexBuffer();
         createCommandBuffers();
         createSyncObjects();
     }
@@ -967,6 +974,7 @@ private:
         const std::array vertexBuffers{*vertexBuffer};
         constexpr std::array<vk::DeviceSize, 1> vertexBufferOffsets{0};
         commandBuffer.bindVertexBuffers(0, vertexBuffers, vertexBufferOffsets);
+        commandBuffer.bindIndexBuffer(*indexBuffer, 0, vk::IndexType::eUint16);
 
         const vk::Viewport viewport{
             .x = 0.0F,
@@ -984,7 +992,7 @@ private:
         // Set the dynamic viewport and scissor, then draw a single triangle
         commandBuffer.setViewport(0, viewport);
         commandBuffer.setScissor(0, scissor);
-        commandBuffer.draw(static_cast<uint32_t>(vertices.size()), 1, 0, 0);
+        commandBuffer.drawIndexed(static_cast<uint32_t>(indices.size()), 1, 0, 0, 0);
 
         // End the dynamic rendering scope and retain the rendered attachment contents
         commandBuffer.endRendering();
@@ -1235,10 +1243,34 @@ private:
         copyBuffer(stagingBuffer.buffer, vertexBuffer, bufferSize);
     }
 
-    [[nodiscard]] AllocatedBuffer createBuffer(
-        vk::DeviceSize size,
-        vk::BufferUsageFlags usage,
-        vk::MemoryPropertyFlags properties)
+    void createIndexBuffer()
+    {
+        const vk::DeviceSize bufferSize = sizeof(indices[0]) * indices.size();
+
+        // Upload the CPU-side uint16_t indices through a host-visible staging buffer.
+        auto stagingBuffer = createBuffer(
+            bufferSize,
+            vk::BufferUsageFlagBits::eTransferSrc,
+            vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent
+        );
+
+        void* mappedMemory = stagingBuffer.memory.mapMemory(0, bufferSize);
+        std::memcpy(mappedMemory, indices.data(), static_cast<std::size_t>(bufferSize));
+        stagingBuffer.memory.unmapMemory();
+
+        // The final index buffer is device-local and receives the staged data by copy.
+        auto deviceLocalBuffer = createBuffer(
+            bufferSize,
+            vk::BufferUsageFlagBits::eTransferDst | vk::BufferUsageFlagBits::eIndexBuffer,
+            vk::MemoryPropertyFlagBits::eDeviceLocal
+        );
+        indexBufferMemory = std::move(deviceLocalBuffer.memory);
+        indexBuffer = std::move(deviceLocalBuffer.buffer);
+
+        copyBuffer(stagingBuffer.buffer, indexBuffer, bufferSize);
+    }
+
+    [[nodiscard]] AllocatedBuffer createBuffer(vk::DeviceSize size, vk::BufferUsageFlags usage, vk::MemoryPropertyFlags properties)
     {
         const std::array queueFamilyIndices{
             graphicsPresentQueueFamilyIndex,
