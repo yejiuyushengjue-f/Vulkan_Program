@@ -96,6 +96,12 @@ public:
     }
 
 private:
+    // The memory member is declared first so the bound buffer is destroyed first.
+    struct AllocatedBuffer {
+        vk::raii::DeviceMemory memory = nullptr;
+        vk::raii::Buffer buffer = nullptr;
+    };
+
     GLFWwindow* window = nullptr;
     vk::raii::Context context;
     vk::raii::Instance instance = nullptr;
@@ -104,7 +110,9 @@ private:
     vk::raii::PhysicalDevice physicalDevice = nullptr;
     vk::raii::Device device = nullptr;
     vk::raii::Queue graphicsPresentQueue = nullptr;
+    vk::raii::Queue transferQueue = nullptr;
     uint32_t graphicsPresentQueueFamilyIndex = 0;
+    uint32_t transferQueueFamilyIndex = 0;
     vk::raii::SwapchainKHR swapChain = nullptr;
     std::vector<vk::Image> swapChainImages;
     std::vector<vk::raii::ImageView> swapChainImageViews;
@@ -113,6 +121,7 @@ private:
     vk::raii::PipelineLayout pipelineLayout = nullptr;
     vk::raii::Pipeline graphicsPipeline = nullptr;
     vk::raii::CommandPool commandPool = nullptr;
+    vk::raii::CommandPool transferCommandPool = nullptr;
     std::vector<vk::raii::CommandBuffer> commandBuffers;
     std::vector<vk::raii::Semaphore> presentCompleteSemaphores;
     std::vector<vk::raii::Semaphore> renderFinishedSemaphores;
@@ -146,7 +155,7 @@ private:
         createSwapChain();
         createImageViews();
         createGraphicsPipeline();
-        createCommandPool();
+        createCommandPools();
         createVertexBuffer();
         createCommandBuffers();
         createSyncObjects();
@@ -314,8 +323,11 @@ private:
             return false;
         }
 
-        // Check if one queue family supports both graphics commands and presentation
+        // Check graphics/presentation support and require a separate transfer family
         if (!findGraphicsAndPresentQueueFamily(device)) {
+            return false;
+        }
+        if (!findDedicatedTransferQueueFamily(device)) {
             return false;
         }
 
@@ -377,14 +389,14 @@ private:
 
         physicalDevice = *suitableDevice;
         graphicsPresentQueueFamilyIndex = findGraphicsAndPresentQueueFamily(physicalDevice).value();
+        transferQueueFamilyIndex = findDedicatedTransferQueueFamily(physicalDevice).value();
     }
 
     // Find the first queue family that can both draw and present to this window surface
     std::optional<uint32_t> findGraphicsAndPresentQueueFamily(const vk::raii::PhysicalDevice& device) const
     {
         const auto queueFamilies = device.getQueueFamilyProperties();
-        const auto queueFamilyIndices =
-            std::views::iota(uint32_t{0}, static_cast<uint32_t>(queueFamilies.size()));
+        const auto queueFamilyIndices = std::views::iota(uint32_t{0}, static_cast<uint32_t>(queueFamilies.size()));
 
         const auto suitableQueueFamily = std::ranges::find_if(
             queueFamilyIndices,
@@ -394,8 +406,7 @@ private:
                     queueFamily.queueCount > 0 &&
                     static_cast<bool>(queueFamily.queueFlags & vk::QueueFlagBits::eGraphics);
 
-                return supportsGraphics &&
-                       device.getSurfaceSupportKHR(index, *surface);
+                return supportsGraphics && device.getSurfaceSupportKHR(index, *surface);
             });
 
         if (suitableQueueFamily == queueFamilyIndices.end()) {
@@ -405,17 +416,57 @@ private:
         return *suitableQueueFamily;
     }
 
+    // Prefer a transfer-only family, then fall back to any non-graphics transfer family
+    std::optional<uint32_t> findDedicatedTransferQueueFamily(const vk::raii::PhysicalDevice& candidateDevice) const
+    {
+        const auto queueFamilies = candidateDevice.getQueueFamilyProperties();
+        const auto queueFamilyIndices = std::views::iota(uint32_t{0}, static_cast<uint32_t>(queueFamilies.size()));
+        const auto supportsTransferWithoutGraphics =
+            [&queueFamilies](uint32_t index) {
+                const auto& queueFamily = queueFamilies[index];
+                return queueFamily.queueCount > 0 &&
+                       static_cast<bool>(queueFamily.queueFlags & vk::QueueFlagBits::eTransfer) &&
+                       !static_cast<bool>(queueFamily.queueFlags & vk::QueueFlagBits::eGraphics);
+            };
+
+        const auto transferOnlyQueueFamily = std::ranges::find_if(
+            queueFamilyIndices,
+            [&](uint32_t index) {
+                // A transfer-only queue can let the driver schedule copies without
+                // competing with graphics or compute work on the same queue family.
+                return supportsTransferWithoutGraphics(index) &&
+                       !static_cast<bool>(queueFamilies[index].queueFlags & vk::QueueFlagBits::eCompute);
+            });
+        if (transferOnlyQueueFamily != queueFamilyIndices.end()) {
+            return *transferOnlyQueueFamily;
+        }
+
+        const auto nonGraphicsTransferQueueFamily = std::ranges::find_if(queueFamilyIndices, supportsTransferWithoutGraphics);
+        if (nonGraphicsTransferQueueFamily == queueFamilyIndices.end()) {
+            return std::nullopt;
+        }
+
+        return *nonGraphicsTransferQueueFamily;
+    }
+
     // Create a logical device from the selected physical device
     void createLogicalDevice()
     {
-        // Create one queue that supports both graphics and presentation
-        // Queue priorities must remain valid until device creation returns
+        // Request one graphics/presentation queue and one dedicated transfer queue.
+        // Queue priorities must remain valid until device creation returns.
         constexpr float queuePriority = 1.0F;
-        const vk::DeviceQueueCreateInfo queueCreateInfo{
-            .queueFamilyIndex = graphicsPresentQueueFamilyIndex,
-            .queueCount = 1,
-            .pQueuePriorities = &queuePriority,
-        };
+        const std::array<vk::DeviceQueueCreateInfo, 2> queueCreateInfos{{
+            vk::DeviceQueueCreateInfo{
+                .queueFamilyIndex = graphicsPresentQueueFamilyIndex,
+                .queueCount = 1,
+                .pQueuePriorities = &queuePriority,
+            },
+            vk::DeviceQueueCreateInfo{
+                .queueFamilyIndex = transferQueueFamilyIndex,
+                .queueCount = 1,
+                .pQueuePriorities = &queuePriority,
+            },
+        }};
 
         // Enable exactly the same features that were checked during physical device selection
         vk::StructureChain<
@@ -436,8 +487,8 @@ private:
         // Device extensions are separate from the instance extensions enabled earlier
         const vk::DeviceCreateInfo createInfo{
             .pNext = &featureChain.get<vk::PhysicalDeviceFeatures2>(),
-            .queueCreateInfoCount = 1,
-            .pQueueCreateInfos = &queueCreateInfo,
+            .queueCreateInfoCount = static_cast<uint32_t>(queueCreateInfos.size()),
+            .pQueueCreateInfos = queueCreateInfos.data(),
             // Enable the required device extensions for swapchain support
             .enabledExtensionCount = static_cast<uint32_t>(requiredDeviceExtensions.size()),
             .ppEnabledExtensionNames = requiredDeviceExtensions.data(),
@@ -447,6 +498,7 @@ private:
         // The queue is owned by the logical device and is destroyed with it
         device = vk::raii::Device(physicalDevice, createInfo);
         graphicsPresentQueue = vk::raii::Queue(device, graphicsPresentQueueFamilyIndex, 0);
+        transferQueue = vk::raii::Queue(device, transferQueueFamilyIndex, 0);
     }
 
     // Prefer an sRGB format so colors are interpreted in the expected color space
@@ -783,15 +835,23 @@ private:
         graphicsPipeline = vk::raii::Pipeline(device, nullptr, pipelineCreateInfoChain.get<vk::GraphicsPipelineCreateInfo>());
     }
 
-    // Allocate command-buffer storage for the graphics/presentation queue family
-    void createCommandPool()
+    // Create separate pools because command buffers must be submitted to a queue
+    // from the same family as the pool that allocated them.
+    void createCommandPools()
     {
         const vk::CommandPoolCreateInfo poolInfo{
             .flags = vk::CommandPoolCreateFlagBits::eResetCommandBuffer,
             .queueFamilyIndex = graphicsPresentQueueFamilyIndex,
         };
-
         commandPool = vk::raii::CommandPool(device, poolInfo);
+
+        const vk::CommandPoolCreateInfo transferPoolInfo{
+            // Transfer command buffers are short-lived, so advertise that usage
+            // pattern to the driver with eTransient.
+            .flags = vk::CommandPoolCreateFlagBits::eTransient,
+            .queueFamilyIndex = transferQueueFamilyIndex,
+        };
+        transferCommandPool = vk::raii::CommandPool(device, transferPoolInfo);
     }
 
     // Allocate one independently recordable primary command buffer per in-flight frame
@@ -1147,31 +1207,125 @@ private:
     void createVertexBuffer()
     {
         const vk::DeviceSize bufferSize = sizeof(vertices[0]) * vertices.size();
-        const vk::BufferCreateInfo bufferInfo{
-            .flags = vk::BufferCreateFlags{0},
-            .size = bufferSize,
-            .usage = vk::BufferUsageFlagBits::eVertexBuffer,
-            .sharingMode = vk::SharingMode::eExclusive,
-            .queueFamilyIndexCount = 0,
-            .pQueueFamilyIndices = nullptr,
-        };
 
-        vertexBuffer = vk::raii::Buffer(device, bufferInfo);
-
-        const vk::MemoryRequirements memoryRequirements = vertexBuffer.getMemoryRequirements();
-        const vk::MemoryPropertyFlags hostMemoryProperties = vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent;
-        const vk::MemoryAllocateInfo allocateInfo{
-            .allocationSize = memoryRequirements.size,
-            .memoryTypeIndex = findMemoryType(memoryRequirements.memoryTypeBits, hostMemoryProperties),
-        };
-
-        vertexBufferMemory = vk::raii::DeviceMemory(device, allocateInfo);
-        vertexBuffer.bindMemory(*vertexBufferMemory, 0);
+        // The CPU writes vertices into this temporary, host-visible source buffer.
+        auto stagingBuffer = createBuffer(
+            bufferSize,
+            vk::BufferUsageFlagBits::eTransferSrc,
+            vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent
+        );
 
         // Host-coherent memory makes the copied vertex data visible without an explicit flushMappedMemoryRanges call.
-        void* mappedMemory = vertexBufferMemory.mapMemory(0, bufferSize);
+        void* mappedMemory = stagingBuffer.memory.mapMemory(0, bufferSize);
         std::memcpy(mappedMemory, vertices.data(), static_cast<std::size_t>(bufferSize));
-        vertexBufferMemory.unmapMemory();
+        stagingBuffer.memory.unmapMemory();
+
+        // The final vertex buffer stays in device-local memory for efficient GPU reads.
+        // eTransferDst is required because it receives data from the staging buffer.
+        auto deviceLocalBuffer = createBuffer(
+            bufferSize,
+            vk::BufferUsageFlagBits::eTransferDst | vk::BufferUsageFlagBits::eVertexBuffer,
+            vk::MemoryPropertyFlagBits::eDeviceLocal
+        );
+        vertexBufferMemory = std::move(deviceLocalBuffer.memory);
+        vertexBuffer = std::move(deviceLocalBuffer.buffer);
+
+        // copyBuffer waits for its fence, so the staging allocation remains alive
+        // until the transfer has completed and can then be destroyed safely.
+        copyBuffer(stagingBuffer.buffer, vertexBuffer, bufferSize);
+    }
+
+    [[nodiscard]] AllocatedBuffer createBuffer(
+        vk::DeviceSize size,
+        vk::BufferUsageFlags usage,
+        vk::MemoryPropertyFlags properties)
+    {
+        const std::array queueFamilyIndices{
+            graphicsPresentQueueFamilyIndex,
+            transferQueueFamilyIndex,
+        };
+        // Concurrent sharing lets the transfer family write the buffer and the
+        // graphics family read it without explicit ownership-release/acquire barriers.
+        const vk::BufferCreateInfo bufferInfo{
+            .flags = vk::BufferCreateFlags{0},
+            .size = size,
+            .usage = usage,
+            .sharingMode = vk::SharingMode::eConcurrent,
+            .queueFamilyIndexCount = static_cast<uint32_t>(queueFamilyIndices.size()),
+            .pQueueFamilyIndices = queueFamilyIndices.data(),
+        };
+
+        AllocatedBuffer allocatedBuffer{
+            .memory = nullptr,
+            .buffer = vk::raii::Buffer(device, bufferInfo),
+        };
+
+        // A Vulkan buffer does not own storage; query its size/alignment/type mask,
+        // then allocate a compatible memory type and bind it at offset zero.
+        const vk::MemoryRequirements memoryRequirements =
+            allocatedBuffer.buffer.getMemoryRequirements();
+        const vk::MemoryAllocateInfo allocateInfo{
+            .allocationSize = memoryRequirements.size,
+            .memoryTypeIndex = findMemoryType(memoryRequirements.memoryTypeBits, properties),
+        };
+
+        allocatedBuffer.memory = vk::raii::DeviceMemory(device, allocateInfo);
+        allocatedBuffer.buffer.bindMemory(*allocatedBuffer.memory, 0);
+
+        return allocatedBuffer;
+    }
+
+    void copyBuffer(vk::raii::Buffer& srcBuffer, vk::raii::Buffer& dstBuffer, vk::DeviceSize size)
+    {
+        // Allocate this one-time command buffer from the transfer family's pool.
+        const vk::CommandBufferAllocateInfo allocateInfo{
+            .commandPool = *transferCommandPool,
+            .level = vk::CommandBufferLevel::ePrimary,
+            .commandBufferCount = 1,
+        };
+
+        auto commandBuffers = vk::raii::CommandBuffers(device, allocateInfo);
+        auto& commandBuffer = commandBuffers.front();
+
+        const vk::CommandBufferBeginInfo beginInfo{
+            .flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit,
+            .pInheritanceInfo = nullptr,
+        };
+        commandBuffer.begin(beginInfo);
+
+        const vk::BufferCopy copyRegion{
+            .srcOffset = 0,
+            .dstOffset = 0,
+            .size = size,
+        };
+        commandBuffer.copyBuffer(*srcBuffer, *dstBuffer, copyRegion);
+
+        commandBuffer.end();
+
+        const vk::CommandBufferSubmitInfo commandBufferInfo{
+            .commandBuffer = *commandBuffer,
+            .deviceMask = 1,
+        };
+        const vk::SubmitInfo2 submitInfo{
+            .commandBufferInfoCount = 1,
+            .pCommandBufferInfos = &commandBufferInfo,
+        };
+        const vk::FenceCreateInfo fenceInfo{
+            .flags = vk::FenceCreateFlags{0},
+        };
+        const vk::raii::Fence transferCompleteFence(device, fenceInfo);
+
+        // A fence waits for only this submission instead of stalling the entire
+        // transfer queue with waitIdle(), and can later scale to batched uploads.
+        transferQueue.submit2(submitInfo, *transferCompleteFence);
+
+        const vk::Result waitResult = device.waitForFences(
+            *transferCompleteFence,
+            vk::True,
+            std::numeric_limits<uint64_t>::max());
+        if (waitResult != vk::Result::eSuccess) {
+            throw std::runtime_error("Failed to wait for the buffer transfer fence!");
+        }
     }
 };
 
