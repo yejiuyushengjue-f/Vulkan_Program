@@ -1,5 +1,6 @@
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstddef>
 #include <cstdlib>
 #include <cstring>
@@ -16,6 +17,7 @@
 #include <vector>
 
 #include <glm/glm.hpp>
+#include <glm/gtc/matrix_transform.hpp>
 
 #if defined(__INTELLISENSE__) || !defined(USE_CPP20_MODULES)
 #include <vulkan/vulkan_raii.hpp>
@@ -79,6 +81,13 @@ struct Vertex {
     }
 };
 
+// Keep this layout binary-compatible with UniformBuffer in shader.slang.
+struct UniformBufferObject {
+    glm::mat4 model;
+    glm::mat4 view;
+    glm::mat4 proj;
+};
+
 const std::vector<Vertex> vertices = {
     {{-0.5f, -0.5f}, {1.0f, 0.0f, 0.0f}},
     {{0.5f, -0.5f}, {0.0f, 1.0f, 0.0f}},
@@ -122,6 +131,7 @@ private:
     std::vector<vk::raii::ImageView> swapChainImageViews;
     vk::SurfaceFormatKHR swapChainSurfaceFormat;
     vk::Extent2D swapChainExtent;
+    vk::raii::DescriptorSetLayout descriptorSetLayout = nullptr;
     vk::raii::PipelineLayout pipelineLayout = nullptr;
     vk::raii::Pipeline graphicsPipeline = nullptr;
     vk::raii::CommandPool commandPool = nullptr;
@@ -138,6 +148,10 @@ private:
     vk::raii::Buffer vertexBuffer = nullptr;
     vk::raii::DeviceMemory indexBufferMemory = nullptr;
     vk::raii::Buffer indexBuffer = nullptr;
+    // Memory is declared before buffers so buffers are destroyed first by RAII.
+    std::vector<vk::raii::DeviceMemory> uniformBuffersMemory;
+    std::vector<vk::raii::Buffer> uniformBuffers;
+    std::vector<void*> uniformBuffersMapped;
 
     void initWindow()
     {
@@ -160,10 +174,12 @@ private:
         createLogicalDevice();
         createSwapChain();
         createImageViews();
+        createDescriptorSetLayout();
         createGraphicsPipeline();
         createCommandPools();
         createVertexBuffer();
         createIndexBuffer();
+        createUniformBuffers();
         createCommandBuffers();
         createSyncObjects();
     }
@@ -689,6 +705,25 @@ private:
         return vk::raii::ShaderModule(device, createInfo);
     }
 
+    // Describe set 0, binding 0: one UBO read by the vertex shader.
+    void createDescriptorSetLayout()
+    {
+        constexpr vk::DescriptorSetLayoutBinding uboLayoutBinding{
+            .binding = 0,
+            .descriptorType = vk::DescriptorType::eUniformBuffer,
+            .descriptorCount = 1,
+            .stageFlags = vk::ShaderStageFlagBits::eVertex,
+            .pImmutableSamplers = nullptr,
+        };
+        const vk::DescriptorSetLayoutCreateInfo layoutInfo{
+            .flags = vk::DescriptorSetLayoutCreateFlags{0},
+            .bindingCount = 1,
+            .pBindings = &uboLayoutBinding,
+        };
+
+        descriptorSetLayout = vk::raii::DescriptorSetLayout(device, layoutInfo);
+    }
+
     // Prepare the programmable and fixed-function graphics pipeline state
     void createGraphicsPipeline()
     {
@@ -798,11 +833,12 @@ private:
             .pAttachments = &colorBlendAttachment,
         };
 
-        // No descriptor sets or push constants are used by the current shaders
+        // Set 0 must match the UniformBuffer declaration in the vertex shader.
+        const std::array descriptorSetLayouts{*descriptorSetLayout};
         const vk::PipelineLayoutCreateInfo pipelineLayoutInfo{
             .flags = vk::PipelineLayoutCreateFlags{0},
-            .setLayoutCount = 0,
-            .pSetLayouts = nullptr,
+            .setLayoutCount = static_cast<uint32_t>(descriptorSetLayouts.size()),
+            .pSetLayouts = descriptorSetLayouts.data(),
             .pushConstantRangeCount = 0,
             .pPushConstantRanges = nullptr,
         };
@@ -1095,6 +1131,10 @@ private:
         const uint32_t imageIndex = acquireResult.value;
         const vk::Semaphore renderFinishedSemaphore = *renderFinishedSemaphores.at(imageIndex);
 
+        // The current frame's fence has completed, so its persistently mapped UBO
+        // is no longer being read by the GPU and can be updated safely.
+        updateUniformBuffer(currentFrame);
+
         // This frame's command buffer is idle now and can be reset and rerecorded
         commandBuffer.reset();
         recordCommandBuffer(commandBuffer, imageIndex);
@@ -1270,6 +1310,56 @@ private:
         copyBuffer(stagingBuffer.buffer, indexBuffer, bufferSize);
     }
 
+    void createUniformBuffers()
+    {
+        if (!uniformBuffers.empty() || !uniformBuffersMemory.empty() || !uniformBuffersMapped.empty()) {
+            throw std::logic_error("Uniform buffers have already been created!");
+        }
+
+        constexpr vk::DeviceSize bufferSize = sizeof(UniformBufferObject);
+        uniformBuffersMemory.reserve(MAX_FRAMES_IN_FLIGHT);
+        uniformBuffers.reserve(MAX_FRAMES_IN_FLIGHT);
+        uniformBuffersMapped.reserve(MAX_FRAMES_IN_FLIGHT);
+
+        for (const uint32_t frameIndex : std::views::iota(uint32_t{0}, MAX_FRAMES_IN_FLIGHT)) {
+            static_cast<void>(frameIndex);
+            auto uniformBuffer = createBuffer(
+                bufferSize,
+                vk::BufferUsageFlagBits::eUniformBuffer,
+                vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent
+            );
+
+            uniformBuffersMemory.emplace_back(std::move(uniformBuffer.memory));
+            uniformBuffers.emplace_back(std::move(uniformBuffer.buffer));
+            uniformBuffersMapped.emplace_back(uniformBuffersMemory.back().mapMemory(0, bufferSize));
+        }
+    }
+
+    void updateUniformBuffer(uint32_t frameIndex)
+    {
+        static const auto startTime = std::chrono::steady_clock::now();
+        const auto currentTime = std::chrono::steady_clock::now();
+        const float elapsedSeconds = std::chrono::duration<float>(currentTime - startTime).count();
+
+        UniformBufferObject ubo{};
+        ubo.model = glm::rotate(
+            glm::mat4{1.0F},
+            elapsedSeconds * glm::radians(90.0F),
+            glm::vec3{0.0F, 0.0F, 1.0F});
+        ubo.view = glm::lookAt(
+            glm::vec3{2.0F, 2.0F, 2.0F},
+            glm::vec3{0.0F, 0.0F, 0.0F},
+            glm::vec3{0.0F, 0.0F, 1.0F});
+        ubo.proj = glm::perspective(
+            glm::radians(45.0F),
+            static_cast<float>(swapChainExtent.width) / static_cast<float>(swapChainExtent.height),
+            0.1F, 10.0F);
+        // GLM uses OpenGL's inverted clip-space Y convention by default.
+        ubo.proj[1][1] *= -1.0F;
+
+        std::memcpy(uniformBuffersMapped.at(frameIndex), &ubo, sizeof(ubo));
+    }
+
     [[nodiscard]] AllocatedBuffer createBuffer(vk::DeviceSize size, vk::BufferUsageFlags usage, vk::MemoryPropertyFlags properties)
     {
         const std::array queueFamilyIndices{
@@ -1307,6 +1397,7 @@ private:
         return allocatedBuffer;
     }
 
+    // Copy data from a host-visible buffer to a device-local buffer using a one-time command buffer
     void copyBuffer(vk::raii::Buffer& srcBuffer, vk::raii::Buffer& dstBuffer, vk::DeviceSize size)
     {
         // Allocate this one-time command buffer from the transfer family's pool.
