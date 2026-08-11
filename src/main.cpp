@@ -83,9 +83,9 @@ struct Vertex {
 
 // Keep this layout binary-compatible with UniformBuffer in shader.slang.
 struct UniformBufferObject {
-    glm::mat4 model;
-    glm::mat4 view;
-    glm::mat4 proj;
+    alignas(16) glm::mat4 model;
+    alignas(16) glm::mat4 view;
+    alignas(16) glm::mat4 proj;
 };
 
 const std::vector<Vertex> vertices = {
@@ -132,6 +132,8 @@ private:
     vk::SurfaceFormatKHR swapChainSurfaceFormat;
     vk::Extent2D swapChainExtent;
     vk::raii::DescriptorSetLayout descriptorSetLayout = nullptr;
+    vk::raii::DescriptorPool descriptorPool = nullptr;
+    std::vector<vk::raii::DescriptorSet> descriptorSets;
     vk::raii::PipelineLayout pipelineLayout = nullptr;
     vk::raii::Pipeline graphicsPipeline = nullptr;
     vk::raii::CommandPool commandPool = nullptr;
@@ -180,6 +182,8 @@ private:
         createVertexBuffer();
         createIndexBuffer();
         createUniformBuffers();
+        createDescriptorPool();
+        createDescriptorSets();
         createCommandBuffers();
         createSyncObjects();
     }
@@ -785,14 +789,14 @@ private:
             .pScissors = nullptr,
         };
 
-        // Fill clockwise front-facing triangles and cull their back faces
+        // Projection flips clip-space Y, so front-facing vertices become counter-clockwise.
         const vk::PipelineRasterizationStateCreateInfo rasterizer{
             .flags = vk::PipelineRasterizationStateCreateFlags{0},
             .depthClampEnable = vk::False,
             .rasterizerDiscardEnable = vk::False,
             .polygonMode = vk::PolygonMode::eFill,
             .cullMode = vk::CullModeFlagBits::eBack,
-            .frontFace = vk::FrontFace::eClockwise,
+            .frontFace = vk::FrontFace::eCounterClockwise,
             .depthBiasEnable = vk::False,
             .depthBiasConstantFactor = 0.0F,
             .depthBiasClamp = 0.0F,
@@ -948,7 +952,7 @@ private:
     }
 
     // Record dynamic rendering commands for the acquired swapchain image
-    void recordCommandBuffer(vk::raii::CommandBuffer& commandBuffer, uint32_t imageIndex)
+    void recordCommandBuffer(vk::raii::CommandBuffer& commandBuffer, uint32_t imageIndex, uint32_t frameIndex)
     {
         if (imageIndex >= swapChainImages.size()) {
             throw std::out_of_range("Swapchain image index is out of range!");
@@ -1011,6 +1015,12 @@ private:
         constexpr std::array<vk::DeviceSize, 1> vertexBufferOffsets{0};
         commandBuffer.bindVertexBuffers(0, vertexBuffers, vertexBufferOffsets);
         commandBuffer.bindIndexBuffer(*indexBuffer, 0, vk::IndexType::eUint16);
+
+        // Set 0 selects the UBO belonging to this frame in flight.
+        const std::array currentDescriptorSets{*descriptorSets.at(frameIndex)};
+        commandBuffer.bindDescriptorSets(
+            vk::PipelineBindPoint::eGraphics,
+            *pipelineLayout, 0, currentDescriptorSets, {});
 
         const vk::Viewport viewport{
             .x = 0.0F,
@@ -1137,7 +1147,7 @@ private:
 
         // This frame's command buffer is idle now and can be reset and rerecorded
         commandBuffer.reset();
-        recordCommandBuffer(commandBuffer, imageIndex);
+        recordCommandBuffer(commandBuffer, imageIndex, currentFrame);
 
         // Wait for acquisition before color output, then signal after all commands
         const vk::SemaphoreSubmitInfo waitSemaphoreInfo{
@@ -1448,6 +1458,73 @@ private:
             std::numeric_limits<uint64_t>::max());
         if (waitResult != vk::Result::eSuccess) {
             throw std::runtime_error("Failed to wait for the buffer transfer fence!");
+        }
+    }
+
+    void createDescriptorPool()
+    {
+        if (*descriptorPool != nullptr) {
+            throw std::logic_error("Descriptor pool has already been created!");
+        }
+
+        constexpr vk::DescriptorPoolSize poolSize{
+            .type = vk::DescriptorType::eUniformBuffer,
+            .descriptorCount = MAX_FRAMES_IN_FLIGHT,
+        };
+        const vk::DescriptorPoolCreateInfo poolInfo{
+            .flags = vk::DescriptorPoolCreateFlagBits::eFreeDescriptorSet,
+            .maxSets = MAX_FRAMES_IN_FLIGHT,
+            .poolSizeCount = 1,
+            .pPoolSizes = &poolSize,
+        };
+
+        descriptorPool = vk::raii::DescriptorPool(device, poolInfo);
+    }
+
+    void createDescriptorSets()
+    {
+        if (*descriptorPool == nullptr) {
+            throw std::logic_error("Descriptor pool must be created before descriptor sets!");
+        }
+        if (*descriptorSetLayout == nullptr) {
+            throw std::logic_error("Descriptor set layout must be created before descriptor sets!");
+        }
+        if (uniformBuffers.size() != MAX_FRAMES_IN_FLIGHT) {
+            throw std::logic_error("One uniform buffer is required for every frame in flight!");
+        }
+        if (!descriptorSets.empty()) {
+            throw std::logic_error("Descriptor sets have already been created!");
+        }
+
+        std::array<vk::DescriptorSetLayout, MAX_FRAMES_IN_FLIGHT> descriptorSetLayouts;
+        std::ranges::fill(descriptorSetLayouts, *descriptorSetLayout);
+        const vk::DescriptorSetAllocateInfo allocateInfo{
+            .descriptorPool = *descriptorPool,
+            .descriptorSetCount = static_cast<uint32_t>(descriptorSetLayouts.size()),
+            .pSetLayouts = descriptorSetLayouts.data(),
+        };
+
+        descriptorSets = vk::raii::DescriptorSets(device, allocateInfo);
+
+        for (const uint32_t frameIndex : std::views::iota(uint32_t{0}, MAX_FRAMES_IN_FLIGHT)) {
+            static_cast<void>(frameIndex);
+            const vk::DescriptorBufferInfo bufferInfo{
+                .buffer = *uniformBuffers.at(frameIndex),
+                .offset = 0,
+                .range = sizeof(UniformBufferObject),
+            };
+            const vk::WriteDescriptorSet descriptorWrite{
+                .dstSet = *descriptorSets.at(frameIndex),
+                .dstBinding = 0,
+                .dstArrayElement = 0,
+                .descriptorCount = 1,
+                .descriptorType = vk::DescriptorType::eUniformBuffer,
+                .pImageInfo = nullptr,
+                .pBufferInfo = &bufferInfo,
+                .pTexelBufferView = nullptr,
+            };
+
+            device.updateDescriptorSets(descriptorWrite, {});
         }
     }
 };
