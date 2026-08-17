@@ -91,6 +91,10 @@ set_target_properties(${PROJECT_NAME} PROPERTIES
 
 target_compile_definitions(${PROJECT_NAME} PRIVATE
     SHADER_SPIRV_PATH="${SHADER_SPIRV}"
+    TEXTURE_PATH="${CMAKE_CURRENT_SOURCE_DIR}/textures/texture.jpg"
+)
+target_include_directories(${PROJECT_NAME} PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/include"
 )
 target_link_libraries(${PROJECT_NAME} PRIVATE
     Vulkan::cppm

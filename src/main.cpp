@@ -9,6 +9,7 @@
 #include <iostream>
 #include <iterator>
 #include <limits>
+#include <memory>
 #include <optional>
 #include <ranges>
 #include <stdexcept>
@@ -18,6 +19,9 @@
 
 #include <glm/glm.hpp>
 #include <glm/gtc/matrix_transform.hpp>
+
+#define STB_IMAGE_IMPLEMENTATION
+#include <stb_image.h>
 
 #if defined(__INTELLISENSE__) || !defined(USE_CPP20_MODULES)
 #include <vulkan/vulkan_raii.hpp>
@@ -115,6 +119,12 @@ private:
         vk::raii::Buffer buffer = nullptr;
     };
 
+    // As with buffers, keep memory before the bound image for reverse RAII teardown.
+    struct AllocatedImage {
+        vk::raii::DeviceMemory memory = nullptr;
+        vk::raii::Image image = nullptr;
+    };
+
     GLFWwindow* window = nullptr;
     vk::raii::Context context;
     vk::raii::Instance instance = nullptr;
@@ -150,6 +160,8 @@ private:
     vk::raii::Buffer vertexBuffer = nullptr;
     vk::raii::DeviceMemory indexBufferMemory = nullptr;
     vk::raii::Buffer indexBuffer = nullptr;
+    vk::raii::DeviceMemory textureImageMemory = nullptr;
+    vk::raii::Image textureImage = nullptr;
     // Memory is declared before buffers so buffers are destroyed first by RAII.
     std::vector<vk::raii::DeviceMemory> uniformBuffersMemory;
     std::vector<vk::raii::Buffer> uniformBuffers;
@@ -179,6 +191,7 @@ private:
         createDescriptorSetLayout();
         createGraphicsPipeline();
         createCommandPools();
+        createTextureImage();
         createVertexBuffer();
         createIndexBuffer();
         createUniformBuffers();
@@ -1370,6 +1383,291 @@ private:
         std::memcpy(uniformBuffersMapped.at(frameIndex), &ubo, sizeof(ubo));
     }
 
+    [[nodiscard]] AllocatedImage createImage(uint32_t width, uint32_t height, vk::Format format,
+         vk::ImageTiling tiling, vk::ImageUsageFlags usage, vk::MemoryPropertyFlags properties)
+    {
+        // The transfer queue uploads texels and the graphics queue will sample them.
+        // Concurrent sharing avoids a queue-family ownership transfer between them.
+        const std::array queueFamilyIndices{
+            transferQueueFamilyIndex,
+            graphicsPresentQueueFamilyIndex,
+        };
+        const vk::ImageCreateInfo imageInfo{
+            .flags = vk::ImageCreateFlags{0},
+            .imageType = vk::ImageType::e2D,
+            .format = format,
+            .extent = {width, height, 1},
+            .mipLevels = 1,
+            .arrayLayers = 1,
+            .samples = vk::SampleCountFlagBits::e1,
+            .tiling = tiling,
+            .usage = usage,
+            .sharingMode = vk::SharingMode::eConcurrent,
+            .queueFamilyIndexCount = static_cast<uint32_t>(queueFamilyIndices.size()),
+            .pQueueFamilyIndices = queueFamilyIndices.data(),
+            .initialLayout = vk::ImageLayout::eUndefined,
+        };
+
+        AllocatedImage allocatedImage{
+            .memory = nullptr,
+            .image = vk::raii::Image(device, imageInfo),
+        };
+        const vk::MemoryRequirements memoryRequirements =
+            allocatedImage.image.getMemoryRequirements();
+        const vk::MemoryAllocateInfo allocateInfo{
+            .allocationSize = memoryRequirements.size,
+            .memoryTypeIndex = findMemoryType(
+                memoryRequirements.memoryTypeBits,
+                properties),
+        };
+
+        allocatedImage.memory = vk::raii::DeviceMemory(device, allocateInfo);
+        allocatedImage.image.bindMemory(*allocatedImage.memory, 0);
+        return allocatedImage;
+    }
+
+    [[nodiscard]] vk::raii::CommandBuffer beginSingleTimeCommands(
+        vk::raii::CommandPool& pool)
+    {
+        const vk::CommandBufferAllocateInfo allocateInfo{
+            .commandPool = *pool,
+            .level = vk::CommandBufferLevel::ePrimary,
+            .commandBufferCount = 1,
+        };
+        auto commandBuffers = vk::raii::CommandBuffers(device, allocateInfo);
+        auto commandBuffer = std::move(commandBuffers.front());
+        const vk::CommandBufferBeginInfo beginInfo{
+            .flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit,
+            .pInheritanceInfo = nullptr,
+        };
+        commandBuffer.begin(beginInfo);
+        return commandBuffer;
+    }
+
+    void endSingleTimeCommands(
+        vk::raii::CommandBuffer&& commandBuffer,
+        vk::raii::Queue& queue)
+    {
+        commandBuffer.end();
+        const vk::CommandBufferSubmitInfo commandBufferInfo{
+            .commandBuffer = *commandBuffer,
+            .deviceMask = 1,
+        };
+        const vk::SubmitInfo2 submitInfo{
+            .commandBufferInfoCount = 1,
+            .pCommandBufferInfos = &commandBufferInfo,
+        };
+        const vk::FenceCreateInfo fenceInfo{
+            .flags = vk::FenceCreateFlags{0},
+        };
+        const vk::raii::Fence completionFence(device, fenceInfo);
+
+        queue.submit2(submitInfo, *completionFence);
+        const vk::Result waitResult = device.waitForFences(
+            *completionFence,
+            vk::True,
+            std::numeric_limits<uint64_t>::max());
+        if (waitResult != vk::Result::eSuccess) {
+            throw std::runtime_error("Failed to wait for a one-time command fence!");
+        }
+    }
+
+    static void transitionTextureImageLayout(vk::raii::CommandBuffer& commandBuffer, const vk::raii::Image& image,
+        vk::ImageLayout oldLayout,vk::ImageLayout newLayout)
+    {
+        vk::PipelineStageFlags2 sourceStageMask;
+        vk::AccessFlags2 sourceAccessMask;
+        vk::PipelineStageFlags2 destinationStageMask;
+        vk::AccessFlags2 destinationAccessMask;
+
+        if (oldLayout == vk::ImageLayout::eUndefined && newLayout == vk::ImageLayout::eTransferDstOptimal) {
+            sourceStageMask = vk::PipelineStageFlagBits2::eNone;
+            sourceAccessMask = vk::AccessFlags2{0};
+            destinationStageMask = vk::PipelineStageFlagBits2::eTransfer;
+            destinationAccessMask = vk::AccessFlagBits2::eTransferWrite;
+        } else if (oldLayout == vk::ImageLayout::eTransferDstOptimal && newLayout == vk::ImageLayout::eShaderReadOnlyOptimal) {
+            // The inter-queue semaphore supplies the transfer-write dependency;
+            // this barrier runs on the graphics queue and makes it visible to shaders.
+            sourceStageMask = vk::PipelineStageFlagBits2::eNone;
+            sourceAccessMask = vk::AccessFlags2{0};
+            destinationStageMask = vk::PipelineStageFlagBits2::eFragmentShader;
+            destinationAccessMask = vk::AccessFlagBits2::eShaderRead;
+        } else {
+            throw std::invalid_argument("Unsupported texture image layout transition!");
+        }
+
+        const vk::ImageMemoryBarrier2 barrier{
+            .srcStageMask = sourceStageMask,
+            .srcAccessMask = sourceAccessMask,
+            .dstStageMask = destinationStageMask,
+            .dstAccessMask = destinationAccessMask,
+            .oldLayout = oldLayout,
+            .newLayout = newLayout,
+            .srcQueueFamilyIndex = vk::QueueFamilyIgnored,
+            .dstQueueFamilyIndex = vk::QueueFamilyIgnored,
+            .image = *image,
+            .subresourceRange = {
+                .aspectMask = vk::ImageAspectFlagBits::eColor,
+                .baseMipLevel = 0,
+                .levelCount = 1,
+                .baseArrayLayer = 0,
+                .layerCount = 1,
+            },
+        };
+        const vk::DependencyInfo dependencyInfo{
+            .imageMemoryBarrierCount = 1,
+            .pImageMemoryBarriers = &barrier,
+        };
+        commandBuffer.pipelineBarrier2(dependencyInfo);
+    }
+
+    static void copyBufferToImage(
+        vk::raii::CommandBuffer& commandBuffer,
+        const vk::raii::Buffer& buffer,
+        const vk::raii::Image& image,
+        uint32_t width,
+        uint32_t height)
+    {
+        const vk::BufferImageCopy copyRegion{
+            .bufferOffset = 0,
+            .bufferRowLength = 0,
+            .bufferImageHeight = 0,
+            .imageSubresource = {
+                .aspectMask = vk::ImageAspectFlagBits::eColor,
+                .mipLevel = 0,
+                .baseArrayLayer = 0,
+                .layerCount = 1,
+            },
+            .imageOffset = {0, 0, 0},
+            .imageExtent = {width, height, 1},
+        };
+        commandBuffer.copyBufferToImage(
+            *buffer,
+            *image,
+            vk::ImageLayout::eTransferDstOptimal,
+            copyRegion);
+    }
+
+    void uploadTextureImage(const vk::raii::Buffer& stagingBuffer, uint32_t width, uint32_t height)
+    {
+        auto transferCommandBuffer = beginSingleTimeCommands(transferCommandPool);
+        transitionTextureImageLayout(
+            transferCommandBuffer,
+            textureImage,
+            vk::ImageLayout::eUndefined,
+            vk::ImageLayout::eTransferDstOptimal);
+        copyBufferToImage(
+            transferCommandBuffer,
+            stagingBuffer,
+            textureImage,
+            width,
+            height);
+        transferCommandBuffer.end();
+
+        const vk::SemaphoreCreateInfo semaphoreInfo{
+            .flags = vk::SemaphoreCreateFlags{0},
+        };
+        const vk::raii::Semaphore transferCompleteSemaphore(device, semaphoreInfo);
+        const vk::CommandBufferSubmitInfo transferCommandInfo{
+            .commandBuffer = *transferCommandBuffer,
+            .deviceMask = 1,
+        };
+        const vk::SemaphoreSubmitInfo signalSemaphoreInfo{
+            .semaphore = *transferCompleteSemaphore,
+            .value = 0,
+            .stageMask = vk::PipelineStageFlagBits2::eAllCommands,
+            .deviceIndex = 0,
+        };
+        const vk::SubmitInfo2 transferSubmitInfo{
+            .commandBufferInfoCount = 1,
+            .pCommandBufferInfos = &transferCommandInfo,
+            .signalSemaphoreInfoCount = 1,
+            .pSignalSemaphoreInfos = &signalSemaphoreInfo,
+        };
+        transferQueue.submit2(transferSubmitInfo, nullptr);
+
+        // A pure transfer queue cannot use the fragment-shader pipeline stage.
+        // Hand the dependency to the graphics queue before the final transition.
+        auto graphicsCommandBuffer = beginSingleTimeCommands(commandPool);
+        transitionTextureImageLayout(
+            graphicsCommandBuffer,
+            textureImage,
+            vk::ImageLayout::eTransferDstOptimal,
+            vk::ImageLayout::eShaderReadOnlyOptimal);
+        graphicsCommandBuffer.end();
+
+        const vk::SemaphoreSubmitInfo waitSemaphoreInfo{
+            .semaphore = *transferCompleteSemaphore,
+            .value = 0,
+            .stageMask = vk::PipelineStageFlagBits2::eAllCommands,
+            .deviceIndex = 0,
+        };
+        const vk::CommandBufferSubmitInfo graphicsCommandInfo{
+            .commandBuffer = *graphicsCommandBuffer,
+            .deviceMask = 1,
+        };
+        const vk::SubmitInfo2 graphicsSubmitInfo{
+            .waitSemaphoreInfoCount = 1,
+            .pWaitSemaphoreInfos = &waitSemaphoreInfo,
+            .commandBufferInfoCount = 1,
+            .pCommandBufferInfos = &graphicsCommandInfo,
+        };
+        const vk::FenceCreateInfo fenceInfo{
+            .flags = vk::FenceCreateFlags{0},
+        };
+        const vk::raii::Fence uploadCompleteFence(device, fenceInfo);
+        graphicsPresentQueue.submit2(graphicsSubmitInfo, *uploadCompleteFence);
+
+        const vk::Result waitResult = device.waitForFences(
+            *uploadCompleteFence,
+            vk::True,
+            std::numeric_limits<uint64_t>::max());
+        if (waitResult != vk::Result::eSuccess) {
+            throw std::runtime_error("Failed to wait for the texture upload fence!");
+        }
+    }
+
+    void createTextureImage()
+    {
+        int textureWidth = 0; int textureHeight = 0; int textureChannels = 0;
+
+        using StbiPixels = std::unique_ptr<stbi_uc, decltype(&stbi_image_free)>;
+        StbiPixels pixels{
+            stbi_load(TEXTURE_PATH, &textureWidth, &textureHeight, &textureChannels, STBI_rgb_alpha),
+            &stbi_image_free,
+        };
+        if (!pixels || textureWidth <= 0 || textureHeight <= 0) {
+            const char* failureReason = stbi_failure_reason();
+            throw std::runtime_error(
+                std::string{"Failed to load texture image: "} +
+                (failureReason ? failureReason : "unknown stb_image error"));
+        }
+        const vk::DeviceSize imageSize = static_cast<vk::DeviceSize>(textureWidth) * static_cast<vk::DeviceSize>(textureHeight) * STBI_rgb_alpha;
+        
+        auto stagingBuffer = createBuffer(
+            imageSize, vk::BufferUsageFlagBits::eTransferSrc,
+            vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent);
+        void* mappedMemory = stagingBuffer.memory.mapMemory(0, imageSize);
+        std::memcpy(mappedMemory, pixels.get(), static_cast<std::size_t>(imageSize));
+        stagingBuffer.memory.unmapMemory();
+        pixels.reset();
+
+        auto allocatedTexture = createImage(
+            static_cast<uint32_t>(textureWidth),
+            static_cast<uint32_t>(textureHeight),
+            vk::Format::eR8G8B8A8Srgb,
+            vk::ImageTiling::eOptimal,
+            vk::ImageUsageFlagBits::eTransferDst | vk::ImageUsageFlagBits::eSampled,
+            vk::MemoryPropertyFlagBits::eDeviceLocal);
+        textureImageMemory = std::move(allocatedTexture.memory);
+        textureImage = std::move(allocatedTexture.image);
+
+        uploadTextureImage(
+            stagingBuffer.buffer,
+            static_cast<uint32_t>(textureWidth),
+            static_cast<uint32_t>(textureHeight));
+    }
+
     [[nodiscard]] AllocatedBuffer createBuffer(vk::DeviceSize size, vk::BufferUsageFlags usage, vk::MemoryPropertyFlags properties)
     {
         const std::array queueFamilyIndices{
@@ -1410,21 +1708,7 @@ private:
     // Copy data from a host-visible buffer to a device-local buffer using a one-time command buffer
     void copyBuffer(vk::raii::Buffer& srcBuffer, vk::raii::Buffer& dstBuffer, vk::DeviceSize size)
     {
-        // Allocate this one-time command buffer from the transfer family's pool.
-        const vk::CommandBufferAllocateInfo allocateInfo{
-            .commandPool = *transferCommandPool,
-            .level = vk::CommandBufferLevel::ePrimary,
-            .commandBufferCount = 1,
-        };
-
-        auto commandBuffers = vk::raii::CommandBuffers(device, allocateInfo);
-        auto& commandBuffer = commandBuffers.front();
-
-        const vk::CommandBufferBeginInfo beginInfo{
-            .flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit,
-            .pInheritanceInfo = nullptr,
-        };
-        commandBuffer.begin(beginInfo);
+        auto commandBuffer = beginSingleTimeCommands(transferCommandPool);
 
         const vk::BufferCopy copyRegion{
             .srcOffset = 0,
@@ -1432,33 +1716,7 @@ private:
             .size = size,
         };
         commandBuffer.copyBuffer(*srcBuffer, *dstBuffer, copyRegion);
-
-        commandBuffer.end();
-
-        const vk::CommandBufferSubmitInfo commandBufferInfo{
-            .commandBuffer = *commandBuffer,
-            .deviceMask = 1,
-        };
-        const vk::SubmitInfo2 submitInfo{
-            .commandBufferInfoCount = 1,
-            .pCommandBufferInfos = &commandBufferInfo,
-        };
-        const vk::FenceCreateInfo fenceInfo{
-            .flags = vk::FenceCreateFlags{0},
-        };
-        const vk::raii::Fence transferCompleteFence(device, fenceInfo);
-
-        // A fence waits for only this submission instead of stalling the entire
-        // transfer queue with waitIdle(), and can later scale to batched uploads.
-        transferQueue.submit2(submitInfo, *transferCompleteFence);
-
-        const vk::Result waitResult = device.waitForFences(
-            *transferCompleteFence,
-            vk::True,
-            std::numeric_limits<uint64_t>::max());
-        if (waitResult != vk::Result::eSuccess) {
-            throw std::runtime_error("Failed to wait for the buffer transfer fence!");
-        }
+        endSingleTimeCommands(std::move(commandBuffer), transferQueue);
     }
 
     void createDescriptorPool()
