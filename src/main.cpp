@@ -34,6 +34,7 @@ import vulkan_hpp;
 
 constexpr uint32_t WIDTH = 1600;
 constexpr uint32_t HEIGHT = 1200;
+constexpr vk::Format TEXTURE_FORMAT = vk::Format::eR8G8B8A8Srgb;
 
 const std::vector validationLayers = {
     "VK_LAYER_KHRONOS_validation"
@@ -160,8 +161,11 @@ private:
     vk::raii::Buffer vertexBuffer = nullptr;
     vk::raii::DeviceMemory indexBufferMemory = nullptr;
     vk::raii::Buffer indexBuffer = nullptr;
+    // Keep the dependent view after the image so RAII destroys the view first.
     vk::raii::DeviceMemory textureImageMemory = nullptr;
     vk::raii::Image textureImage = nullptr;
+    vk::raii::ImageView textureImageView = nullptr;
+    vk::raii::Sampler textureSampler = nullptr;
     // Memory is declared before buffers so buffers are destroyed first by RAII.
     std::vector<vk::raii::DeviceMemory> uniformBuffersMemory;
     std::vector<vk::raii::Buffer> uniformBuffers;
@@ -192,6 +196,8 @@ private:
         createGraphicsPipeline();
         createCommandPools();
         createTextureImage();
+        createTextureImageView();
+        createTextureSampler();
         createVertexBuffer();
         createIndexBuffer();
         createUniformBuffers();
@@ -401,6 +407,7 @@ private:
             vk::PhysicalDeviceExtendedDynamicStateFeaturesEXT>();
 
         const bool supportsRequiredFeatures =
+            features.template get<vk::PhysicalDeviceFeatures2>().features.samplerAnisotropy &&
             features.template get<vk::PhysicalDeviceVulkan11Features>().shaderDrawParameters &&
             features.template get<vk::PhysicalDeviceVulkan13Features>().dynamicRendering &&
             features.template get<vk::PhysicalDeviceVulkan13Features>().synchronization2 &&
@@ -515,7 +522,7 @@ private:
             vk::PhysicalDeviceVulkan13Features,
             vk::PhysicalDeviceExtendedDynamicStateFeaturesEXT>
             featureChain{
-                {},                                     // No Vulkan 1.0 features are required yet
+                {.features = {.samplerAnisotropy = true}}, // Anisotropic texture filtering
                 {.shaderDrawParameters = true},         // Vulkan 1.1 shader draw parameters
                 {
                     .synchronization2 = true,           // Vulkan 1.3 synchronization commands
@@ -645,29 +652,36 @@ private:
         swapChainImageViews.reserve(swapChainImages.size());
 
         for (const vk::Image image : swapChainImages) {
-            const vk::ImageViewCreateInfo createInfo{
-                .flags = vk::ImageViewCreateFlags{0},
-                .image = image,
-                .viewType = vk::ImageViewType::e2D,
-                .format = swapChainSurfaceFormat.format,
-                // Use the default mapping of color channels to the image's format
-                .components = {
-                    vk::ComponentSwizzle::eIdentity,
-                    vk::ComponentSwizzle::eIdentity,
-                    vk::ComponentSwizzle::eIdentity,
-                    vk::ComponentSwizzle::eIdentity,
-                },
-                .subresourceRange = {
-                    .aspectMask = vk::ImageAspectFlagBits::eColor,
-                    .baseMipLevel = 0,
-                    .levelCount = 1,
-                    .baseArrayLayer = 0,
-                    .layerCount = 1,
-                },
-            };
-
-            swapChainImageViews.emplace_back(device, createInfo);
+            swapChainImageViews.push_back(createImageView(image, swapChainSurfaceFormat.format));
         }
+    }
+
+    // Both swapchain images and owned texture images are raw VkImage handles at
+    // the ImageView boundary, so one helper covers both without RAII conversions.
+    [[nodiscard]] vk::raii::ImageView createImageView(vk::Image image, vk::Format format)
+    {
+        const vk::ImageViewCreateInfo createInfo{
+            .flags = vk::ImageViewCreateFlags{0},
+            .image = image,
+            .viewType = vk::ImageViewType::e2D,
+            .format = format,
+            // Use the default mapping of color channels to the image's format
+            .components = {
+                vk::ComponentSwizzle::eIdentity,
+                vk::ComponentSwizzle::eIdentity,
+                vk::ComponentSwizzle::eIdentity,
+                vk::ComponentSwizzle::eIdentity,
+            },
+            .subresourceRange = {
+                .aspectMask = vk::ImageAspectFlagBits::eColor,
+                .baseMipLevel = 0,
+                .levelCount = 1,
+                .baseArrayLayer = 0,
+                .layerCount = 1,
+            },
+        };
+
+        return vk::raii::ImageView(device, createInfo);
     }
 
     // Read SPIR-V into aligned 32-bit words, as required by ShaderModuleCreateInfo
@@ -1655,7 +1669,7 @@ private:
         auto allocatedTexture = createImage(
             static_cast<uint32_t>(textureWidth),
             static_cast<uint32_t>(textureHeight),
-            vk::Format::eR8G8B8A8Srgb,
+            TEXTURE_FORMAT,
             vk::ImageTiling::eOptimal,
             vk::ImageUsageFlagBits::eTransferDst | vk::ImageUsageFlagBits::eSampled,
             vk::MemoryPropertyFlagBits::eDeviceLocal);
@@ -1666,6 +1680,39 @@ private:
             stagingBuffer.buffer,
             static_cast<uint32_t>(textureWidth),
             static_cast<uint32_t>(textureHeight));
+    }
+
+    void createTextureImageView()
+    {
+        // Images are accessed by shaders through a view, not through VkImage directly.
+        textureImageView = createImageView(*textureImage, TEXTURE_FORMAT);
+    }
+
+    void createTextureSampler()
+    {
+        const vk::PhysicalDeviceProperties properties = physicalDevice.getProperties();
+        const vk::SamplerCreateInfo samplerInfo{
+            .flags = vk::SamplerCreateFlags{0},
+            .magFilter = vk::Filter::eLinear,
+            .minFilter = vk::Filter::eLinear,
+            .mipmapMode = vk::SamplerMipmapMode::eLinear,
+            .addressModeU = vk::SamplerAddressMode::eRepeat,
+            .addressModeV = vk::SamplerAddressMode::eRepeat,
+            .addressModeW = vk::SamplerAddressMode::eRepeat,
+            .mipLodBias = 0.0F,
+            // Use the highest anisotropy supported by the selected physical device.
+            .anisotropyEnable = vk::True,
+            .maxAnisotropy = properties.limits.maxSamplerAnisotropy,
+            .compareEnable = vk::False,
+            .compareOp = vk::CompareOp::eAlways,
+            .minLod = 0.0F,
+            .maxLod = 0.0F,
+            .borderColor = vk::BorderColor::eIntOpaqueBlack,
+            // Normalized UV coordinates keep sampling independent of image dimensions.
+            .unnormalizedCoordinates = vk::False,
+        };
+
+        textureSampler = vk::raii::Sampler(device, samplerInfo);
     }
 
     [[nodiscard]] AllocatedBuffer createBuffer(vk::DeviceSize size, vk::BufferUsageFlags usage, vk::MemoryPropertyFlags properties)
