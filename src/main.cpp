@@ -56,6 +56,7 @@ constexpr bool enableValidationLayers = true;
 struct Vertex {
     glm::vec2 pos;
     glm::vec3 color;
+    glm::vec2 texCoord;
 
     // One Vertex object is consumed for each vertex from binding 0.
     [[nodiscard]] static constexpr vk::VertexInputBindingDescription getBindingDescription() noexcept
@@ -65,9 +66,8 @@ struct Vertex {
                 .inputRate = vk::VertexInputRate::eVertex};
     }
 
-    // Match Vertex::pos/color with the shader's locations 0 and 1.
-    [[nodiscard]] static constexpr std::array<vk::VertexInputAttributeDescription, 2>
-    getAttributeDescriptions() noexcept
+    // Match Vertex::pos/color/texCoord with the shader's locations 0, 1, and 2.
+    [[nodiscard]] static constexpr std::array<vk::VertexInputAttributeDescription, 3> getAttributeDescriptions() noexcept
     {
         return {{
             vk::VertexInputAttributeDescription{
@@ -82,6 +82,12 @@ struct Vertex {
                 .format = vk::Format::eR32G32B32Sfloat,
                 .offset = offsetof(Vertex, color),
             },
+            vk::VertexInputAttributeDescription{
+                .location = 2,
+                .binding = 0,
+                .format = vk::Format::eR32G32Sfloat,
+                .offset = offsetof(Vertex, texCoord),
+            },
         }};
     }
 };
@@ -94,10 +100,10 @@ struct UniformBufferObject {
 };
 
 const std::vector<Vertex> vertices = {
-    {{-0.5f, -0.5f}, {1.0f, 0.0f, 0.0f}},
-    {{0.5f, -0.5f}, {0.0f, 1.0f, 0.0f}},
-    {{0.5f, 0.5f}, {0.0f, 0.0f, 1.0f}},
-    {{-0.5f, 0.5f}, {1.0f, 1.0f, 1.0f}}
+    {{-0.5f, -0.5f}, {1.0f, 0.0f, 0.0f}, {1.0f, 0.0f}},
+    {{0.5f, -0.5f}, {0.0f, 1.0f, 0.0f}, {0.0f, 0.0f}},
+    {{0.5f, 0.5f}, {0.0f, 0.0f, 1.0f}, {0.0f, 1.0f}},
+    {{-0.5f, 0.5f}, {1.0f, 1.0f, 1.0f}, {1.0f, 1.0f}},
 };
 
 const std::vector<uint16_t> indices = {
@@ -736,20 +742,29 @@ private:
         return vk::raii::ShaderModule(device, createInfo);
     }
 
-    // Describe set 0, binding 0: one UBO read by the vertex shader.
+    // Describe set 0: a vertex-stage UBO and a fragment-stage combined sampler.
     void createDescriptorSetLayout()
     {
-        constexpr vk::DescriptorSetLayoutBinding uboLayoutBinding{
-            .binding = 0,
-            .descriptorType = vk::DescriptorType::eUniformBuffer,
-            .descriptorCount = 1,
-            .stageFlags = vk::ShaderStageFlagBits::eVertex,
-            .pImmutableSamplers = nullptr,
+        constexpr std::array bindings{
+            vk::DescriptorSetLayoutBinding{
+                .binding = 0,
+                .descriptorType = vk::DescriptorType::eUniformBuffer,
+                .descriptorCount = 1,
+                .stageFlags = vk::ShaderStageFlagBits::eVertex,
+                .pImmutableSamplers = nullptr,
+            },
+            vk::DescriptorSetLayoutBinding{
+                .binding = 1,
+                .descriptorType = vk::DescriptorType::eCombinedImageSampler,
+                .descriptorCount = 1,
+                .stageFlags = vk::ShaderStageFlagBits::eFragment,
+                .pImmutableSamplers = nullptr,
+            },
         };
         const vk::DescriptorSetLayoutCreateInfo layoutInfo{
             .flags = vk::DescriptorSetLayoutCreateFlags{0},
-            .bindingCount = 1,
-            .pBindings = &uboLayoutBinding,
+            .bindingCount = static_cast<uint32_t>(bindings.size()),
+            .pBindings = bindings.data(),
         };
 
         descriptorSetLayout = vk::raii::DescriptorSetLayout(device, layoutInfo);
@@ -1043,7 +1058,7 @@ private:
         commandBuffer.bindVertexBuffers(0, vertexBuffers, vertexBufferOffsets);
         commandBuffer.bindIndexBuffer(*indexBuffer, 0, vk::IndexType::eUint16);
 
-        // Set 0 selects the UBO belonging to this frame in flight.
+        // Set 0 selects this frame's UBO plus the shared texture view and sampler.
         const std::array currentDescriptorSets{*descriptorSets.at(frameIndex)};
         commandBuffer.bindDescriptorSets(
             vk::PipelineBindPoint::eGraphics,
@@ -1062,7 +1077,7 @@ private:
             .extent = swapChainExtent,
         };
 
-        // Set the dynamic viewport and scissor, then draw a single triangle
+        // Set the dynamic viewport and scissor, then draw the indexed square.
         commandBuffer.setViewport(0, viewport);
         commandBuffer.setScissor(0, scissor);
         commandBuffer.drawIndexed(static_cast<uint32_t>(indices.size()), 1, 0, 0, 0);
@@ -1772,15 +1787,22 @@ private:
             throw std::logic_error("Descriptor pool has already been created!");
         }
 
-        constexpr vk::DescriptorPoolSize poolSize{
-            .type = vk::DescriptorType::eUniformBuffer,
-            .descriptorCount = MAX_FRAMES_IN_FLIGHT,
+        // Each frame owns one UBO descriptor and one combined image sampler.
+        constexpr std::array poolSizes{
+            vk::DescriptorPoolSize{
+                .type = vk::DescriptorType::eUniformBuffer,
+                .descriptorCount = MAX_FRAMES_IN_FLIGHT,
+            },
+            vk::DescriptorPoolSize{
+                .type = vk::DescriptorType::eCombinedImageSampler,
+                .descriptorCount = MAX_FRAMES_IN_FLIGHT,
+            },
         };
         const vk::DescriptorPoolCreateInfo poolInfo{
             .flags = vk::DescriptorPoolCreateFlagBits::eFreeDescriptorSet,
             .maxSets = MAX_FRAMES_IN_FLIGHT,
-            .poolSizeCount = 1,
-            .pPoolSizes = &poolSize,
+            .poolSizeCount = static_cast<uint32_t>(poolSizes.size()),
+            .pPoolSizes = poolSizes.data(),
         };
 
         descriptorPool = vk::raii::DescriptorPool(device, poolInfo);
@@ -1797,6 +1819,9 @@ private:
         if (uniformBuffers.size() != MAX_FRAMES_IN_FLIGHT) {
             throw std::logic_error("One uniform buffer is required for every frame in flight!");
         }
+        if (*textureImageView == nullptr || *textureSampler == nullptr) {
+            throw std::logic_error("Texture image view and sampler must be created before descriptor sets!");
+        }
         if (!descriptorSets.empty()) {
             throw std::logic_error("Descriptor sets have already been created!");
         }
@@ -1812,24 +1837,40 @@ private:
         descriptorSets = vk::raii::DescriptorSets(device, allocateInfo);
 
         for (const uint32_t frameIndex : std::views::iota(uint32_t{0}, MAX_FRAMES_IN_FLIGHT)) {
-            static_cast<void>(frameIndex);
             const vk::DescriptorBufferInfo bufferInfo{
                 .buffer = *uniformBuffers.at(frameIndex),
                 .offset = 0,
                 .range = sizeof(UniformBufferObject),
             };
-            const vk::WriteDescriptorSet descriptorWrite{
-                .dstSet = *descriptorSets.at(frameIndex),
-                .dstBinding = 0,
-                .dstArrayElement = 0,
-                .descriptorCount = 1,
-                .descriptorType = vk::DescriptorType::eUniformBuffer,
-                .pImageInfo = nullptr,
-                .pBufferInfo = &bufferInfo,
-                .pTexelBufferView = nullptr,
+            const vk::DescriptorImageInfo imageInfo{
+                .sampler = *textureSampler,
+                .imageView = *textureImageView,
+                .imageLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
+            };
+            const std::array descriptorWrites{
+                vk::WriteDescriptorSet{
+                    .dstSet = *descriptorSets.at(frameIndex),
+                    .dstBinding = 0,
+                    .dstArrayElement = 0,
+                    .descriptorCount = 1,
+                    .descriptorType = vk::DescriptorType::eUniformBuffer,
+                    .pImageInfo = nullptr,
+                    .pBufferInfo = &bufferInfo,
+                    .pTexelBufferView = nullptr,
+                },
+                vk::WriteDescriptorSet{
+                    .dstSet = *descriptorSets.at(frameIndex),
+                    .dstBinding = 1,
+                    .dstArrayElement = 0,
+                    .descriptorCount = 1,
+                    .descriptorType = vk::DescriptorType::eCombinedImageSampler,
+                    .pImageInfo = &imageInfo,
+                    .pBufferInfo = nullptr,
+                    .pTexelBufferView = nullptr,
+                },
             };
 
-            device.updateDescriptorSets(descriptorWrite, {});
+            device.updateDescriptorSets(descriptorWrites, {});
         }
     }
 };
