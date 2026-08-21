@@ -12,11 +12,13 @@
 #include <memory>
 #include <optional>
 #include <ranges>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <utility>
 #include <vector>
 
+#define GLM_FORCE_DEPTH_ZERO_TO_ONE
 #include <glm/glm.hpp>
 #include <glm/gtc/matrix_transform.hpp>
 
@@ -54,7 +56,7 @@ constexpr bool enableValidationLayers = true;
 #endif
 
 struct Vertex {
-    glm::vec2 pos;
+    glm::vec3 pos;
     glm::vec3 color;
     glm::vec2 texCoord;
 
@@ -73,7 +75,7 @@ struct Vertex {
             vk::VertexInputAttributeDescription{
                 .location = 0,
                 .binding = 0,
-                .format = vk::Format::eR32G32Sfloat,
+                .format = vk::Format::eR32G32B32Sfloat,
                 .offset = offsetof(Vertex, pos),
             },
             vk::VertexInputAttributeDescription{
@@ -100,14 +102,20 @@ struct UniformBufferObject {
 };
 
 const std::vector<Vertex> vertices = {
-    {{-0.5f, -0.5f}, {1.0f, 0.0f, 0.0f}, {1.0f, 0.0f}},
-    {{0.5f, -0.5f}, {0.0f, 1.0f, 0.0f}, {0.0f, 0.0f}},
-    {{0.5f, 0.5f}, {0.0f, 0.0f, 1.0f}, {0.0f, 1.0f}},
-    {{-0.5f, 0.5f}, {1.0f, 1.0f, 1.0f}, {1.0f, 1.0f}},
+    {{-0.5f, -0.5f, 0.0f}, {1.0f, 0.0f, 0.0f}, {0.0f, 0.0f}},
+    {{0.5f, -0.5f, 0.0f}, {0.0f, 1.0f, 0.0f}, {1.0f, 0.0f}},
+    {{0.5f, 0.5f, 0.0f}, {0.0f, 0.0f, 1.0f}, {1.0f, 1.0f}},
+    {{-0.5f, 0.5f, 0.0f}, {1.0f, 1.0f, 1.0f}, {0.0f, 1.0f}},
+
+    {{-0.5f, -0.5f, -0.5f}, {1.0f, 0.0f, 0.0f}, {0.0f, 0.0f}},
+    {{0.5f, -0.5f, -0.5f}, {0.0f, 1.0f, 0.0f}, {1.0f, 0.0f}},
+    {{0.5f, 0.5f, -0.5f}, {0.0f, 0.0f, 1.0f}, {1.0f, 1.0f}},
+    {{-0.5f, 0.5f, -0.5f}, {1.0f, 1.0f, 1.0f}, {0.0f, 1.0f}}
 };
 
 const std::vector<uint16_t> indices = {
-    0, 1, 2, 2, 3, 0
+    0, 1, 2, 2, 3, 0,
+    4, 5, 6, 6, 7, 4
 };
 
 class HelloTriangleApplication {
@@ -148,6 +156,11 @@ private:
     std::vector<vk::raii::ImageView> swapChainImageViews;
     vk::SurfaceFormatKHR swapChainSurfaceFormat;
     vk::Extent2D swapChainExtent;
+    vk::Format depthFormat = vk::Format::eUndefined;
+    // Memory precedes the bound image and its view for safe reverse-order teardown.
+    vk::raii::DeviceMemory depthImageMemory = nullptr;
+    vk::raii::Image depthImage = nullptr;
+    vk::raii::ImageView depthImageView = nullptr;
     vk::raii::DescriptorSetLayout descriptorSetLayout = nullptr;
     vk::raii::DescriptorPool descriptorPool = nullptr;
     std::vector<vk::raii::DescriptorSet> descriptorSets;
@@ -198,6 +211,7 @@ private:
         createLogicalDevice();
         createSwapChain();
         createImageViews();
+        createDepthResources();
         createDescriptorSetLayout();
         createGraphicsPipeline();
         createCommandPools();
@@ -658,13 +672,13 @@ private:
         swapChainImageViews.reserve(swapChainImages.size());
 
         for (const vk::Image image : swapChainImages) {
-            swapChainImageViews.push_back(createImageView(image, swapChainSurfaceFormat.format));
+            swapChainImageViews.push_back(createImageView(image, swapChainSurfaceFormat.format, vk::ImageAspectFlagBits::eColor));
         }
     }
 
     // Both swapchain images and owned texture images are raw VkImage handles at
     // the ImageView boundary, so one helper covers both without RAII conversions.
-    [[nodiscard]] vk::raii::ImageView createImageView(vk::Image image, vk::Format format)
+    [[nodiscard]] vk::raii::ImageView createImageView(vk::Image image, vk::Format format, vk::ImageAspectFlags aspectFlags) const
     {
         const vk::ImageViewCreateInfo createInfo{
             .flags = vk::ImageViewCreateFlags{0},
@@ -679,7 +693,7 @@ private:
                 vk::ComponentSwizzle::eIdentity,
             },
             .subresourceRange = {
-                .aspectMask = vk::ImageAspectFlagBits::eColor,
+                .aspectMask = aspectFlags,
                 .baseMipLevel = 0,
                 .levelCount = 1,
                 .baseArrayLayer = 0,
@@ -773,6 +787,10 @@ private:
     // Prepare the programmable and fixed-function graphics pipeline state
     void createGraphicsPipeline()
     {
+        if (depthFormat == vk::Format::eUndefined) {
+            throw std::logic_error("Depth resources must be created before the graphics pipeline!");
+        }
+
         const auto shaderCode = readSpirvFile(SHADER_SPIRV_PATH);
         const vk::raii::ShaderModule shaderModule = createShaderModule(shaderCode);
 
@@ -890,6 +908,15 @@ private:
         };
         pipelineLayout = vk::raii::PipelineLayout(device, pipelineLayoutInfo);
 
+        const vk::PipelineDepthStencilStateCreateInfo depthStencil{
+            .flags = vk::PipelineDepthStencilStateCreateFlags{0},
+            .depthTestEnable = vk::True,
+            .depthWriteEnable = vk::True,
+            .depthCompareOp = vk::CompareOp::eLess,
+            .depthBoundsTestEnable = vk::False,
+            .stencilTestEnable = vk::False,
+        };
+
         // Dynamic rendering describes attachment formats without a render pass object
         vk::StructureChain<vk::GraphicsPipelineCreateInfo, vk::PipelineRenderingCreateInfo> pipelineCreateInfoChain{
                 {
@@ -902,7 +929,7 @@ private:
                     .pViewportState = &viewportState,
                     .pRasterizationState = &rasterizer,
                     .pMultisampleState = &multisampling,
-                    .pDepthStencilState = nullptr,
+                    .pDepthStencilState = &depthStencil,
                     .pColorBlendState = &colorBlending,
                     .pDynamicState = &dynamicState,
                     .layout = *pipelineLayout,
@@ -915,7 +942,7 @@ private:
                     .viewMask = 0,
                     .colorAttachmentCount = 1,
                     .pColorAttachmentFormats = &swapChainSurfaceFormat.format,
-                    .depthAttachmentFormat = vk::Format::eUndefined,
+                    .depthAttachmentFormat = depthFormat,
                     .stencilAttachmentFormat = vk::Format::eUndefined,
                 },
             };
@@ -955,16 +982,17 @@ private:
         commandBuffers = vk::raii::CommandBuffers(device, allocateInfo);
     }
 
-    // Record a Synchronization2 image-layout transition for one swapchain image
+    // Record a Synchronization2 layout transition for any color or depth image.
     void transitionImageLayout(
         vk::raii::CommandBuffer& commandBuffer,
-        uint32_t imageIndex,
+        vk::Image image,
         vk::ImageLayout oldLayout,
         vk::ImageLayout newLayout,
         vk::AccessFlags2 sourceAccessMask,
         vk::AccessFlags2 destinationAccessMask,
         vk::PipelineStageFlags2 sourceStageMask,
-        vk::PipelineStageFlags2 destinationStageMask)
+        vk::PipelineStageFlags2 destinationStageMask,
+        vk::ImageAspectFlags aspectMask)
     {
         const vk::ImageMemoryBarrier2 barrier{
             .srcStageMask = sourceStageMask,
@@ -975,9 +1003,9 @@ private:
             .newLayout = newLayout,
             .srcQueueFamilyIndex = vk::QueueFamilyIgnored,
             .dstQueueFamilyIndex = vk::QueueFamilyIgnored,
-            .image = swapChainImages.at(imageIndex),
+            .image = image,
             .subresourceRange = {
-                .aspectMask = vk::ImageAspectFlagBits::eColor,
+                .aspectMask = aspectMask,
                 .baseMipLevel = 0,
                 .levelCount = 1,
                 .baseArrayLayer = 0,
@@ -1009,13 +1037,28 @@ private:
         // Discard old contents and make the image writable as a color attachment
         transitionImageLayout(
             commandBuffer,
-            imageIndex,
+            swapChainImages.at(imageIndex),
             vk::ImageLayout::eUndefined,
             vk::ImageLayout::eColorAttachmentOptimal,
             vk::AccessFlags2{0},
             vk::AccessFlagBits2::eColorAttachmentWrite,
+            vk::PipelineStageFlagBits2::eNone,
             vk::PipelineStageFlagBits2::eColorAttachmentOutput,
-            vk::PipelineStageFlagBits2::eColorAttachmentOutput
+            vk::ImageAspectFlagBits::eColor
+        );
+
+        // Previous depth contents are discarded, then the image becomes writable
+        // by both early and late depth/stencil tests for this rendering pass.
+        transitionImageLayout(
+            commandBuffer,
+            *depthImage,
+            vk::ImageLayout::eUndefined,
+            vk::ImageLayout::eDepthAttachmentOptimal,
+            vk::AccessFlagBits2::eDepthStencilAttachmentWrite,
+            vk::AccessFlagBits2::eDepthStencilAttachmentRead | vk::AccessFlagBits2::eDepthStencilAttachmentWrite,
+            vk::PipelineStageFlagBits2::eEarlyFragmentTests | vk::PipelineStageFlagBits2::eLateFragmentTests,
+            vk::PipelineStageFlagBits2::eEarlyFragmentTests | vk::PipelineStageFlagBits2::eLateFragmentTests,
+            vk::ImageAspectFlagBits::eDepth
         );
 
         // Clear the color attachment
@@ -1023,6 +1066,9 @@ private:
         clearColor.setFloat32(std::array{0.0F, 0.0F, 0.0F, 1.0F});
         vk::ClearValue clearValue;
         clearValue.setColor(clearColor);
+        // Clear the depth attachment
+        vk::ClearValue clearDepth;
+        clearDepth.setDepthStencil(vk::ClearDepthStencilValue{1.0F, 0});
 
         const vk::RenderingAttachmentInfo colorAttachmentInfo{
             .imageView = *swapChainImageViews.at(imageIndex),
@@ -1034,6 +1080,16 @@ private:
             .storeOp = vk::AttachmentStoreOp::eStore,
             .clearValue = clearValue,
         };
+        const vk::RenderingAttachmentInfo depthAttachmentInfo{
+            .imageView = *depthImageView,
+            .imageLayout = vk::ImageLayout::eDepthAttachmentOptimal,
+            .resolveMode = vk::ResolveModeFlagBits::eNone,
+            .resolveImageView = nullptr,
+            .resolveImageLayout = vk::ImageLayout::eUndefined,
+            .loadOp = vk::AttachmentLoadOp::eClear,
+            .storeOp = vk::AttachmentStoreOp::eDontCare,
+            .clearValue = clearDepth,
+        };
         const vk::RenderingInfo renderingInfo{
             .flags = vk::RenderingFlags{0},
             .renderArea = {
@@ -1044,7 +1100,7 @@ private:
             .viewMask = 0,
             .colorAttachmentCount = 1,
             .pColorAttachments = &colorAttachmentInfo,
-            .pDepthAttachment = nullptr,
+            .pDepthAttachment = &depthAttachmentInfo,
             .pStencilAttachment = nullptr,
         };
 
@@ -1088,13 +1144,14 @@ private:
         // Make the rendered image ready for the presentation engine
         transitionImageLayout(
             commandBuffer,
-            imageIndex,
+            swapChainImages.at(imageIndex),
             vk::ImageLayout::eColorAttachmentOptimal,
             vk::ImageLayout::ePresentSrcKHR,
             vk::AccessFlagBits2::eColorAttachmentWrite,
             vk::AccessFlags2{0},
             vk::PipelineStageFlagBits2::eColorAttachmentOutput,
-            vk::PipelineStageFlagBits2::eBottomOfPipe
+            vk::PipelineStageFlagBits2::eBottomOfPipe,
+            vk::ImageAspectFlagBits::eColor
         );
 
         // End recording so this frame's command buffer is ready for submission
@@ -1245,10 +1302,15 @@ private:
 
     void cleanupSwapChain()
     {
-        // The pipeline bakes in the dynamic-rendering color attachment format
+        // The pipeline bakes in the dynamic-rendering color and depth formats.
         graphicsPipeline = nullptr;
         pipelineLayout = nullptr;
         renderFinishedSemaphores.clear();
+        // Destroy the view and image before releasing the memory bound to it.
+        depthImageView = nullptr;
+        depthImage = nullptr;
+        depthImageMemory = nullptr;
+        depthFormat = vk::Format::eUndefined;
         swapChainImageViews.clear();
         swapChainImages.clear();
         swapChain = nullptr;
@@ -1273,6 +1335,7 @@ private:
 
         createSwapChain();
         createImageViews();
+        createDepthResources();
         createGraphicsPipeline();
         createRenderFinishedSemaphores();
         framebufferResized = false;
@@ -1412,11 +1475,17 @@ private:
         std::memcpy(uniformBuffersMapped.at(frameIndex), &ubo, sizeof(ubo));
     }
 
-    [[nodiscard]] AllocatedImage createImage(uint32_t width, uint32_t height, vk::Format format,
-         vk::ImageTiling tiling, vk::ImageUsageFlags usage, vk::MemoryPropertyFlags properties)
+    [[nodiscard]] AllocatedImage createImage(
+        uint32_t width,
+        uint32_t height,
+        vk::Format format,
+        vk::ImageTiling tiling,
+        vk::ImageUsageFlags usage,
+        vk::MemoryPropertyFlags properties,
+        bool shareBetweenTransferAndGraphics = false)
     {
-        // The transfer queue uploads texels and the graphics queue will sample them.
-        // Concurrent sharing avoids a queue-family ownership transfer between them.
+        // Texture uploads use both queue families, whereas depth attachments remain
+        // exclusive to the graphics family for lower ownership-management overhead.
         const std::array queueFamilyIndices{
             transferQueueFamilyIndex,
             graphicsPresentQueueFamilyIndex,
@@ -1431,9 +1500,9 @@ private:
             .samples = vk::SampleCountFlagBits::e1,
             .tiling = tiling,
             .usage = usage,
-            .sharingMode = vk::SharingMode::eConcurrent,
-            .queueFamilyIndexCount = static_cast<uint32_t>(queueFamilyIndices.size()),
-            .pQueueFamilyIndices = queueFamilyIndices.data(),
+            .sharingMode = shareBetweenTransferAndGraphics ? vk::SharingMode::eConcurrent : vk::SharingMode::eExclusive,
+            .queueFamilyIndexCount = shareBetweenTransferAndGraphics ? static_cast<uint32_t>(queueFamilyIndices.size()) : 0,
+            .pQueueFamilyIndices = shareBetweenTransferAndGraphics ? queueFamilyIndices.data() : nullptr,
             .initialLayout = vk::ImageLayout::eUndefined,
         };
 
@@ -1473,9 +1542,7 @@ private:
         return commandBuffer;
     }
 
-    void endSingleTimeCommands(
-        vk::raii::CommandBuffer&& commandBuffer,
-        vk::raii::Queue& queue)
+    void endSingleTimeCommands(vk::raii::CommandBuffer&& commandBuffer, vk::raii::Queue& queue)
     {
         commandBuffer.end();
         const vk::CommandBufferSubmitInfo commandBufferInfo{
@@ -1499,6 +1566,58 @@ private:
         if (waitResult != vk::Result::eSuccess) {
             throw std::runtime_error("Failed to wait for a one-time command fence!");
         }
+    }
+
+    void createDepthResources()
+    {
+        if (*depthImage != nullptr || *depthImageMemory != nullptr || *depthImageView != nullptr) {
+            throw std::logic_error("Depth resources have already been created!");
+        }
+
+        depthFormat = findDepthFormat();
+        auto allocatedDepthImage = createImage(
+            swapChainExtent.width,
+            swapChainExtent.height,
+            depthFormat,
+            vk::ImageTiling::eOptimal,
+            vk::ImageUsageFlagBits::eDepthStencilAttachment,
+            vk::MemoryPropertyFlagBits::eDeviceLocal);
+        depthImageMemory = std::move(allocatedDepthImage.memory);
+        depthImage = std::move(allocatedDepthImage.image);
+        depthImageView = createImageView(
+            *depthImage,
+            depthFormat,
+            vk::ImageAspectFlagBits::eDepth);
+    }
+
+    [[nodiscard]] vk::Format findDepthFormat() const
+    {
+        constexpr std::array candidates{
+            vk::Format::eD32Sfloat,
+            vk::Format::eD32SfloatS8Uint,
+            vk::Format::eD24UnormS8Uint,
+        };
+        return findSupportedFormat(
+            candidates,
+            vk::ImageTiling::eOptimal,
+            vk::FormatFeatureFlagBits::eDepthStencilAttachment);
+    }
+
+    [[nodiscard]] vk::Format findSupportedFormat(std::span<const vk::Format> candidates, vk::ImageTiling tiling, vk::FormatFeatureFlags requiredFeatures) const
+    {
+        const auto supportedFormat = std::ranges::find_if(
+            candidates,
+            [&](vk::Format candidate) {
+                const vk::FormatProperties properties = physicalDevice.getFormatProperties(candidate);
+                const vk::FormatFeatureFlags availableFeatures =
+                    tiling == vk::ImageTiling::eLinear ? properties.linearTilingFeatures : properties.optimalTilingFeatures;
+                return (availableFeatures & requiredFeatures) == requiredFeatures;
+            });
+        if (supportedFormat == candidates.end()) {
+            throw std::runtime_error("Failed to find a supported image format!");
+        }
+
+        return *supportedFormat;
     }
 
     static void transitionTextureImageLayout(vk::raii::CommandBuffer& commandBuffer, const vk::raii::Image& image,
@@ -1687,7 +1806,8 @@ private:
             TEXTURE_FORMAT,
             vk::ImageTiling::eOptimal,
             vk::ImageUsageFlagBits::eTransferDst | vk::ImageUsageFlagBits::eSampled,
-            vk::MemoryPropertyFlagBits::eDeviceLocal);
+            vk::MemoryPropertyFlagBits::eDeviceLocal,
+            true);
         textureImageMemory = std::move(allocatedTexture.memory);
         textureImage = std::move(allocatedTexture.image);
 
@@ -1700,7 +1820,7 @@ private:
     void createTextureImageView()
     {
         // Images are accessed by shaders through a view, not through VkImage directly.
-        textureImageView = createImageView(*textureImage, TEXTURE_FORMAT);
+        textureImageView = createImageView(*textureImage, TEXTURE_FORMAT, vk::ImageAspectFlagBits::eColor);
     }
 
     void createTextureSampler()
