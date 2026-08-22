@@ -15,15 +15,24 @@
 #include <span>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
 #define GLM_FORCE_DEPTH_ZERO_TO_ONE
+#define GLM_ENABLE_EXPERIMENTAL
 #include <glm/glm.hpp>
 #include <glm/gtc/matrix_transform.hpp>
+#include <glm/gtx/hash.hpp>
 
 #define STB_IMAGE_IMPLEMENTATION
 #include <stb_image.h>
+
+// The bundled fast_float path warns under current MinGW/UCRT64; the built-in
+// parser is sufficient for this tutorial model and keeps third-party builds clean.
+#define TINYOBJLOADER_DISABLE_FAST_FLOAT
+#define TINYOBJLOADER_IMPLEMENTATION
+#include <tiny_obj_loader.h>
 
 #if defined(__INTELLISENSE__) || !defined(USE_CPP20_MODULES)
 #include <vulkan/vulkan_raii.hpp>
@@ -92,6 +101,19 @@ struct Vertex {
             },
         }};
     }
+
+    [[nodiscard]] bool operator==(const Vertex& other) const = default;
+};
+
+template<>
+struct std::hash<Vertex> {
+    [[nodiscard]] std::size_t operator()(const Vertex& vertex) const
+    {
+        const std::size_t positionHash = std::hash<glm::vec3>{}(vertex.pos);
+        const std::size_t colorHash = std::hash<glm::vec3>{}(vertex.color);
+        const std::size_t textureCoordinateHash = std::hash<glm::vec2>{}(vertex.texCoord);
+        return ((positionHash ^ (colorHash << 1U)) >> 1U) ^ (textureCoordinateHash << 1U);
+    }
 };
 
 // Keep this layout binary-compatible with UniformBuffer in shader.slang.
@@ -99,23 +121,6 @@ struct UniformBufferObject {
     alignas(16) glm::mat4 model;
     alignas(16) glm::mat4 view;
     alignas(16) glm::mat4 proj;
-};
-
-const std::vector<Vertex> vertices = {
-    {{-0.5f, -0.5f, 0.0f}, {1.0f, 0.0f, 0.0f}, {0.0f, 0.0f}},
-    {{0.5f, -0.5f, 0.0f}, {0.0f, 1.0f, 0.0f}, {1.0f, 0.0f}},
-    {{0.5f, 0.5f, 0.0f}, {0.0f, 0.0f, 1.0f}, {1.0f, 1.0f}},
-    {{-0.5f, 0.5f, 0.0f}, {1.0f, 1.0f, 1.0f}, {0.0f, 1.0f}},
-
-    {{-0.5f, -0.5f, -0.5f}, {1.0f, 0.0f, 0.0f}, {0.0f, 0.0f}},
-    {{0.5f, -0.5f, -0.5f}, {0.0f, 1.0f, 0.0f}, {1.0f, 0.0f}},
-    {{0.5f, 0.5f, -0.5f}, {0.0f, 0.0f, 1.0f}, {1.0f, 1.0f}},
-    {{-0.5f, 0.5f, -0.5f}, {1.0f, 1.0f, 1.0f}, {0.0f, 1.0f}}
-};
-
-const std::vector<uint16_t> indices = {
-    0, 1, 2, 2, 3, 0,
-    4, 5, 6, 6, 7, 4
 };
 
 class HelloTriangleApplication {
@@ -174,6 +179,8 @@ private:
     std::vector<vk::raii::Fence> drawFences;
     uint32_t currentFrame = 0;
     bool framebufferResized = false;
+    std::vector<Vertex> vertices;
+    std::vector<uint32_t> indices;
     // Declare memory before the buffer so reverse-order RAII destruction releases
     // the buffer before freeing the memory bound to it.
     vk::raii::DeviceMemory vertexBufferMemory = nullptr;
@@ -218,6 +225,7 @@ private:
         createTextureImage();
         createTextureImageView();
         createTextureSampler();
+        loadModel();
         createVertexBuffer();
         createIndexBuffer();
         createUniformBuffers();
@@ -1112,7 +1120,7 @@ private:
         const std::array vertexBuffers{*vertexBuffer};
         constexpr std::array<vk::DeviceSize, 1> vertexBufferOffsets{0};
         commandBuffer.bindVertexBuffers(0, vertexBuffers, vertexBufferOffsets);
-        commandBuffer.bindIndexBuffer(*indexBuffer, 0, vk::IndexType::eUint16);
+        commandBuffer.bindIndexBuffer(*indexBuffer, 0, vk::IndexTypeValue<decltype(indices)::value_type>::value);
 
         // Set 0 selects this frame's UBO plus the shared texture view and sampler.
         const std::array currentDescriptorSets{*descriptorSets.at(frameIndex)};
@@ -1367,9 +1375,93 @@ private:
         return *memoryTypeIt;
     }
 
+    void loadModel()
+    {
+        if (!vertices.empty() || !indices.empty()) {
+            throw std::logic_error("Model geometry has already been loaded!");
+        }
+
+        tinyobj::attrib_t attributes;
+        std::vector<tinyobj::shape_t> shapes;
+        std::vector<tinyobj::material_t> materials;
+        std::string warning;
+        std::string error;
+
+        const std::filesystem::path modelPath{MODEL_PATH};
+        const std::string modelFilename = modelPath.string();
+        const std::string materialBaseDirectory = modelPath.parent_path().generic_string() + '/';
+        if (!tinyobj::LoadObj(&attributes, &shapes, &materials, &warning, &error,
+            modelFilename.c_str(), materialBaseDirectory.c_str(), true)) {
+            throw std::runtime_error(
+                "Failed to load OBJ model '" + modelFilename + "': " + warning + error);
+        }
+        // This tutorial supplies its texture explicitly and intentionally ignores
+        // OBJ material assignments, so non-fatal material warnings need no action.
+
+        std::size_t sourceIndexCount = 0;
+        for (const auto& shape : shapes) {
+            if (!std::ranges::all_of(
+                    shape.mesh.num_face_vertices,
+                    [](unsigned char vertexCount) { return vertexCount == 3; })) {
+                throw std::runtime_error("OBJ triangulation produced a non-triangle face!");
+            }
+            sourceIndexCount += shape.mesh.indices.size();
+        }
+
+        vertices.reserve(sourceIndexCount);
+        indices.reserve(sourceIndexCount);
+        std::unordered_map<Vertex, uint32_t> uniqueVertices;
+        uniqueVertices.reserve(sourceIndexCount);
+
+        for (const auto& shape : shapes) {
+            for (const tinyobj::index_t& index : shape.mesh.indices) {
+                if (index.vertex_index < 0 || index.texcoord_index < 0) {
+                    throw std::runtime_error(
+                        "OBJ model must provide a position and texture coordinates for every vertex!");
+                }
+
+                const std::size_t positionOffset = static_cast<std::size_t>(index.vertex_index) * 3;
+                const std::size_t textureCoordinateOffset = static_cast<std::size_t>(index.texcoord_index) * 2;
+                if (positionOffset + 2 >= attributes.vertices.size() || textureCoordinateOffset + 1 >= attributes.texcoords.size()) {
+                    throw std::runtime_error("OBJ model contains an out-of-range vertex index!");
+                }
+
+                const Vertex vertex{
+                    .pos = {
+                        attributes.vertices[positionOffset],
+                        attributes.vertices[positionOffset + 1],
+                        attributes.vertices[positionOffset + 2],
+                    },
+                    .color = {1.0F, 1.0F, 1.0F},
+                    // OBJ uses a bottom-left texture origin; uploaded images use top-left.
+                    .texCoord = {
+                        attributes.texcoords[textureCoordinateOffset],
+                        1.0F - attributes.texcoords[textureCoordinateOffset + 1],
+                    },
+                };
+
+                if (vertices.size() > std::numeric_limits<uint32_t>::max()) {
+                    throw std::overflow_error("OBJ model has too many unique vertices for uint32 indices!");
+                }
+                const auto [uniqueVertex, inserted] = uniqueVertices.try_emplace(vertex, static_cast<uint32_t>(vertices.size()));
+                if (inserted) {
+                    vertices.push_back(vertex);
+                }
+                indices.push_back(uniqueVertex->second);
+            }
+        }
+
+        if (vertices.empty() || indices.empty()) {
+            throw std::runtime_error("OBJ model does not contain any drawable triangles!");
+        }
+    }
+
     void createVertexBuffer()
     {
-        const vk::DeviceSize bufferSize = sizeof(vertices[0]) * vertices.size();
+        if (vertices.empty()) {
+            throw std::logic_error("Model vertices must be loaded before creating the vertex buffer!");
+        }
+        const vk::DeviceSize bufferSize = sizeof(vertices.front()) * vertices.size();
 
         // The CPU writes vertices into this temporary, host-visible source buffer.
         auto stagingBuffer = createBuffer(
@@ -1400,9 +1492,12 @@ private:
 
     void createIndexBuffer()
     {
-        const vk::DeviceSize bufferSize = sizeof(indices[0]) * indices.size();
+        if (indices.empty()) {
+            throw std::logic_error("Model indices must be loaded before creating the index buffer!");
+        }
+        const vk::DeviceSize bufferSize = sizeof(indices.front()) * indices.size();
 
-        // Upload the CPU-side uint16_t indices through a host-visible staging buffer.
+        // Upload the CPU-side uint32_t indices through a host-visible staging buffer.
         auto stagingBuffer = createBuffer(
             bufferSize,
             vk::BufferUsageFlagBits::eTransferSrc,

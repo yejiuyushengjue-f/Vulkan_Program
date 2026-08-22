@@ -91,7 +91,8 @@ set_target_properties(${PROJECT_NAME} PROPERTIES
 
 target_compile_definitions(${PROJECT_NAME} PRIVATE
     SHADER_SPIRV_PATH="${SHADER_SPIRV}"
-    TEXTURE_PATH="${CMAKE_CURRENT_SOURCE_DIR}/textures/texture.jpg"
+    MODEL_PATH="${CMAKE_CURRENT_SOURCE_DIR}/models/viking_room.obj"
+    TEXTURE_PATH="${CMAKE_CURRENT_SOURCE_DIR}/textures/viking_room.png"
 )
 target_include_directories(${PROJECT_NAME} PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}/include"
