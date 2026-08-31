@@ -1,5 +1,6 @@
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <chrono>
 #include <cstddef>
 #include <cstdlib>
@@ -192,6 +193,7 @@ private:
     vk::raii::Image textureImage = nullptr;
     vk::raii::ImageView textureImageView = nullptr;
     vk::raii::Sampler textureSampler = nullptr;
+    uint32_t textureMipLevels = 1;
     // Memory is declared before buffers so buffers are destroyed first by RAII.
     std::vector<vk::raii::DeviceMemory> uniformBuffersMemory;
     std::vector<vk::raii::Buffer> uniformBuffers;
@@ -680,13 +682,21 @@ private:
         swapChainImageViews.reserve(swapChainImages.size());
 
         for (const vk::Image image : swapChainImages) {
-            swapChainImageViews.push_back(createImageView(image, swapChainSurfaceFormat.format, vk::ImageAspectFlagBits::eColor));
+            swapChainImageViews.push_back(createImageView(
+                image,
+                swapChainSurfaceFormat.format,
+                vk::ImageAspectFlagBits::eColor,
+                1));
         }
     }
 
     // Both swapchain images and owned texture images are raw VkImage handles at
     // the ImageView boundary, so one helper covers both without RAII conversions.
-    [[nodiscard]] vk::raii::ImageView createImageView(vk::Image image, vk::Format format, vk::ImageAspectFlags aspectFlags) const
+    [[nodiscard]] vk::raii::ImageView createImageView(
+        vk::Image image,
+        vk::Format format,
+        vk::ImageAspectFlags aspectFlags,
+        uint32_t levelCount) const
     {
         const vk::ImageViewCreateInfo createInfo{
             .flags = vk::ImageViewCreateFlags{0},
@@ -703,7 +713,7 @@ private:
             .subresourceRange = {
                 .aspectMask = aspectFlags,
                 .baseMipLevel = 0,
-                .levelCount = 1,
+                .levelCount = levelCount,
                 .baseArrayLayer = 0,
                 .layerCount = 1,
             },
@@ -1000,7 +1010,9 @@ private:
         vk::AccessFlags2 destinationAccessMask,
         vk::PipelineStageFlags2 sourceStageMask,
         vk::PipelineStageFlags2 destinationStageMask,
-        vk::ImageAspectFlags aspectMask)
+        vk::ImageAspectFlags aspectMask,
+        uint32_t baseMipLevel = 0,
+        uint32_t levelCount = 1)
     {
         const vk::ImageMemoryBarrier2 barrier{
             .srcStageMask = sourceStageMask,
@@ -1014,8 +1026,8 @@ private:
             .image = image,
             .subresourceRange = {
                 .aspectMask = aspectMask,
-                .baseMipLevel = 0,
-                .levelCount = 1,
+                .baseMipLevel = baseMipLevel,
+                .levelCount = levelCount,
                 .baseArrayLayer = 0,
                 .layerCount = 1,
             },
@@ -1050,7 +1062,9 @@ private:
             vk::ImageLayout::eColorAttachmentOptimal,
             vk::AccessFlags2{0},
             vk::AccessFlagBits2::eColorAttachmentWrite,
-            vk::PipelineStageFlagBits2::eNone,
+            // Chain this layout transition to the acquire-semaphore wait, whose
+            // stage mask is also eColorAttachmentOutput.
+            vk::PipelineStageFlagBits2::eColorAttachmentOutput,
             vk::PipelineStageFlagBits2::eColorAttachmentOutput,
             vk::ImageAspectFlagBits::eColor
         );
@@ -1571,10 +1585,9 @@ private:
     }
 
     [[nodiscard]] AllocatedImage createImage(
-        uint32_t width,
-        uint32_t height,
-        vk::Format format,
-        vk::ImageTiling tiling,
+        uint32_t width, uint32_t height,
+        uint32_t mipLevels,
+        vk::Format format, vk::ImageTiling tiling,
         vk::ImageUsageFlags usage,
         vk::MemoryPropertyFlags properties,
         bool shareBetweenTransferAndGraphics = false)
@@ -1590,7 +1603,7 @@ private:
             .imageType = vk::ImageType::e2D,
             .format = format,
             .extent = {width, height, 1},
-            .mipLevels = 1,
+            .mipLevels = mipLevels,
             .arrayLayers = 1,
             .samples = vk::SampleCountFlagBits::e1,
             .tiling = tiling,
@@ -1619,8 +1632,7 @@ private:
         return allocatedImage;
     }
 
-    [[nodiscard]] vk::raii::CommandBuffer beginSingleTimeCommands(
-        vk::raii::CommandPool& pool)
+    [[nodiscard]] vk::raii::CommandBuffer beginSingleTimeCommands(vk::raii::CommandPool& pool)
     {
         const vk::CommandBufferAllocateInfo allocateInfo{
             .commandPool = *pool,
@@ -1673,6 +1685,7 @@ private:
         auto allocatedDepthImage = createImage(
             swapChainExtent.width,
             swapChainExtent.height,
+            1,
             depthFormat,
             vk::ImageTiling::eOptimal,
             vk::ImageUsageFlagBits::eDepthStencilAttachment,
@@ -1682,7 +1695,8 @@ private:
         depthImageView = createImageView(
             *depthImage,
             depthFormat,
-            vk::ImageAspectFlagBits::eDepth);
+            vk::ImageAspectFlagBits::eDepth,
+            1);
     }
 
     [[nodiscard]] vk::Format findDepthFormat() const
@@ -1715,55 +1729,6 @@ private:
         return *supportedFormat;
     }
 
-    static void transitionTextureImageLayout(vk::raii::CommandBuffer& commandBuffer, const vk::raii::Image& image,
-        vk::ImageLayout oldLayout,vk::ImageLayout newLayout)
-    {
-        vk::PipelineStageFlags2 sourceStageMask;
-        vk::AccessFlags2 sourceAccessMask;
-        vk::PipelineStageFlags2 destinationStageMask;
-        vk::AccessFlags2 destinationAccessMask;
-
-        if (oldLayout == vk::ImageLayout::eUndefined && newLayout == vk::ImageLayout::eTransferDstOptimal) {
-            sourceStageMask = vk::PipelineStageFlagBits2::eNone;
-            sourceAccessMask = vk::AccessFlags2{0};
-            destinationStageMask = vk::PipelineStageFlagBits2::eTransfer;
-            destinationAccessMask = vk::AccessFlagBits2::eTransferWrite;
-        } else if (oldLayout == vk::ImageLayout::eTransferDstOptimal && newLayout == vk::ImageLayout::eShaderReadOnlyOptimal) {
-            // The inter-queue semaphore supplies the transfer-write dependency;
-            // this barrier runs on the graphics queue and makes it visible to shaders.
-            sourceStageMask = vk::PipelineStageFlagBits2::eNone;
-            sourceAccessMask = vk::AccessFlags2{0};
-            destinationStageMask = vk::PipelineStageFlagBits2::eFragmentShader;
-            destinationAccessMask = vk::AccessFlagBits2::eShaderRead;
-        } else {
-            throw std::invalid_argument("Unsupported texture image layout transition!");
-        }
-
-        const vk::ImageMemoryBarrier2 barrier{
-            .srcStageMask = sourceStageMask,
-            .srcAccessMask = sourceAccessMask,
-            .dstStageMask = destinationStageMask,
-            .dstAccessMask = destinationAccessMask,
-            .oldLayout = oldLayout,
-            .newLayout = newLayout,
-            .srcQueueFamilyIndex = vk::QueueFamilyIgnored,
-            .dstQueueFamilyIndex = vk::QueueFamilyIgnored,
-            .image = *image,
-            .subresourceRange = {
-                .aspectMask = vk::ImageAspectFlagBits::eColor,
-                .baseMipLevel = 0,
-                .levelCount = 1,
-                .baseArrayLayer = 0,
-                .layerCount = 1,
-            },
-        };
-        const vk::DependencyInfo dependencyInfo{
-            .imageMemoryBarrierCount = 1,
-            .pImageMemoryBarriers = &barrier,
-        };
-        commandBuffer.pipelineBarrier2(dependencyInfo);
-    }
-
     static void copyBufferToImage(
         vk::raii::CommandBuffer& commandBuffer,
         const vk::raii::Buffer& buffer,
@@ -1791,21 +1756,144 @@ private:
             copyRegion);
     }
 
+    void validateMipmapGenerationSupport(vk::Format format) const
+    {
+        const vk::FormatFeatureFlags requiredBlitFeatures =
+            vk::FormatFeatureFlagBits::eBlitSrc | vk::FormatFeatureFlagBits::eBlitDst | vk::FormatFeatureFlagBits::eSampledImageFilterLinear;
+        const vk::FormatProperties formatProperties = physicalDevice.getFormatProperties(format);
+        if ((formatProperties.optimalTilingFeatures & requiredBlitFeatures) != requiredBlitFeatures) {
+            throw std::runtime_error(
+                "Texture image format does not support linear filtered mipmap blits!");
+        }
+    }
+
+    void generateMipmaps(
+        vk::raii::CommandBuffer& commandBuffer, vk::Image image,
+        int32_t textureWidth, int32_t textureHeight, uint32_t mipLevels)
+    {
+        int32_t mipWidth = textureWidth;
+        int32_t mipHeight = textureHeight;
+        for (const uint32_t mipLevel : std::views::iota(uint32_t{1}, mipLevels)) {
+            // The preceding copy or blit wrote level N-1; make it the source
+            // for the next downsample operation.
+            transitionImageLayout(
+                commandBuffer,
+                image,
+                vk::ImageLayout::eTransferDstOptimal,
+                vk::ImageLayout::eTransferSrcOptimal,
+                vk::AccessFlagBits2::eTransferWrite,
+                vk::AccessFlagBits2::eTransferRead,
+                vk::PipelineStageFlagBits2::eTransfer,
+                vk::PipelineStageFlagBits2::eTransfer,
+                vk::ImageAspectFlagBits::eColor,
+                mipLevel - 1,
+                1);
+
+            const int32_t nextMipWidth = std::max(mipWidth / 2, 1);
+            const int32_t nextMipHeight = std::max(mipHeight / 2, 1);
+            const vk::ImageBlit2 blitRegion{
+                .srcSubresource = {
+                    .aspectMask = vk::ImageAspectFlagBits::eColor,
+                    .mipLevel = mipLevel - 1,
+                    .baseArrayLayer = 0,
+                    .layerCount = 1,
+                },
+                .srcOffsets = std::array{
+                    vk::Offset3D{0, 0, 0},
+                    vk::Offset3D{mipWidth, mipHeight, 1},
+                },
+                .dstSubresource = {
+                    .aspectMask = vk::ImageAspectFlagBits::eColor,
+                    .mipLevel = mipLevel,
+                    .baseArrayLayer = 0,
+                    .layerCount = 1,
+                },
+                .dstOffsets = std::array{
+                    vk::Offset3D{0, 0, 0},
+                    vk::Offset3D{nextMipWidth, nextMipHeight, 1},
+                },
+            };
+            const vk::BlitImageInfo2 blitInfo{
+                .srcImage = image,
+                .srcImageLayout = vk::ImageLayout::eTransferSrcOptimal,
+                .dstImage = image,
+                .dstImageLayout = vk::ImageLayout::eTransferDstOptimal,
+                .regionCount = 1,
+                .pRegions = &blitRegion,
+                .filter = vk::Filter::eLinear,
+            };
+            commandBuffer.blitImage2(blitInfo);
+
+            // Level N-1 will not be written again, so expose it to the sampler.
+            transitionImageLayout(
+                commandBuffer,
+                image,
+                vk::ImageLayout::eTransferSrcOptimal,
+                vk::ImageLayout::eShaderReadOnlyOptimal,
+                vk::AccessFlagBits2::eTransferRead,
+                vk::AccessFlagBits2::eShaderRead,
+                vk::PipelineStageFlagBits2::eTransfer,
+                vk::PipelineStageFlagBits2::eFragmentShader,
+                vk::ImageAspectFlagBits::eColor,
+                mipLevel - 1,
+                1);
+
+            mipWidth = nextMipWidth;
+            mipHeight = nextMipHeight;
+        }
+
+        // The final level is never used as a blit source, but it still needs to become readable by the fragment shader.
+        transitionImageLayout(
+            commandBuffer,
+            image,
+            vk::ImageLayout::eTransferDstOptimal,
+            vk::ImageLayout::eShaderReadOnlyOptimal,
+            vk::AccessFlagBits2::eTransferWrite,
+            vk::AccessFlagBits2::eShaderRead,
+            vk::PipelineStageFlagBits2::eTransfer,
+            vk::PipelineStageFlagBits2::eFragmentShader,
+            vk::ImageAspectFlagBits::eColor,
+            mipLevels - 1,
+            1);
+    }
+
     void uploadTextureImage(const vk::raii::Buffer& stagingBuffer, uint32_t width, uint32_t height)
     {
+        // Validate every failure-prone capability before any queue submission.
+        if (textureMipLevels > 1) {
+            validateMipmapGenerationSupport(TEXTURE_FORMAT);
+        }
+
         auto transferCommandBuffer = beginSingleTimeCommands(transferCommandPool);
-        transitionTextureImageLayout(
+        transitionImageLayout(
             transferCommandBuffer,
-            textureImage,
+            *textureImage,
             vk::ImageLayout::eUndefined,
-            vk::ImageLayout::eTransferDstOptimal);
+            vk::ImageLayout::eTransferDstOptimal,
+            vk::AccessFlags2{0},
+            vk::AccessFlagBits2::eTransferWrite,
+            vk::PipelineStageFlagBits2::eNone,
+            vk::PipelineStageFlagBits2::eTransfer,
+            vk::ImageAspectFlagBits::eColor,
+            0,
+            textureMipLevels);
         copyBufferToImage(
             transferCommandBuffer,
             stagingBuffer,
             textureImage,
-            width,
-            height);
+            width, height);
         transferCommandBuffer.end();
+
+        // A pure transfer queue cannot execute image blits.
+        // Record the graphics work now, then use a semaphore to hand level 0 to the graphics queue.
+        auto graphicsCommandBuffer = beginSingleTimeCommands(commandPool);
+        generateMipmaps(
+            graphicsCommandBuffer,
+            *textureImage,
+            static_cast<int32_t>(width),
+            static_cast<int32_t>(height),
+            textureMipLevels);
+        graphicsCommandBuffer.end();
 
         const vk::SemaphoreCreateInfo semaphoreInfo{
             .flags = vk::SemaphoreCreateFlags{0},
@@ -1827,22 +1915,11 @@ private:
             .signalSemaphoreInfoCount = 1,
             .pSignalSemaphoreInfos = &signalSemaphoreInfo,
         };
-        transferQueue.submit2(transferSubmitInfo, nullptr);
-
-        // A pure transfer queue cannot use the fragment-shader pipeline stage.
-        // Hand the dependency to the graphics queue before the final transition.
-        auto graphicsCommandBuffer = beginSingleTimeCommands(commandPool);
-        transitionTextureImageLayout(
-            graphicsCommandBuffer,
-            textureImage,
-            vk::ImageLayout::eTransferDstOptimal,
-            vk::ImageLayout::eShaderReadOnlyOptimal);
-        graphicsCommandBuffer.end();
 
         const vk::SemaphoreSubmitInfo waitSemaphoreInfo{
             .semaphore = *transferCompleteSemaphore,
             .value = 0,
-            .stageMask = vk::PipelineStageFlagBits2::eAllCommands,
+            .stageMask = vk::PipelineStageFlagBits2::eTransfer,
             .deviceIndex = 0,
         };
         const vk::CommandBufferSubmitInfo graphicsCommandInfo{
@@ -1859,6 +1936,7 @@ private:
             .flags = vk::FenceCreateFlags{0},
         };
         const vk::raii::Fence uploadCompleteFence(device, fenceInfo);
+        transferQueue.submit2(transferSubmitInfo, nullptr);
         graphicsPresentQueue.submit2(graphicsSubmitInfo, *uploadCompleteFence);
 
         const vk::Result waitResult = device.waitForFences(
@@ -1886,7 +1964,9 @@ private:
                 (failureReason ? failureReason : "unknown stb_image error"));
         }
         const vk::DeviceSize imageSize = static_cast<vk::DeviceSize>(textureWidth) * static_cast<vk::DeviceSize>(textureHeight) * STBI_rgb_alpha;
-        
+        // bit_width(max dimension) is exactly floor(log2(max dimension)) + 1.
+        textureMipLevels = std::bit_width(static_cast<uint32_t>(std::max(textureWidth, textureHeight)));
+
         auto stagingBuffer = createBuffer(
             imageSize, vk::BufferUsageFlagBits::eTransferSrc,
             vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent);
@@ -1898,9 +1978,10 @@ private:
         auto allocatedTexture = createImage(
             static_cast<uint32_t>(textureWidth),
             static_cast<uint32_t>(textureHeight),
+            textureMipLevels,
             TEXTURE_FORMAT,
             vk::ImageTiling::eOptimal,
-            vk::ImageUsageFlagBits::eTransferDst | vk::ImageUsageFlagBits::eSampled,
+            vk::ImageUsageFlagBits::eTransferSrc | vk::ImageUsageFlagBits::eTransferDst | vk::ImageUsageFlagBits::eSampled,
             vk::MemoryPropertyFlagBits::eDeviceLocal,
             true);
         textureImageMemory = std::move(allocatedTexture.memory);
@@ -1915,7 +1996,11 @@ private:
     void createTextureImageView()
     {
         // Images are accessed by shaders through a view, not through VkImage directly.
-        textureImageView = createImageView(*textureImage, TEXTURE_FORMAT, vk::ImageAspectFlagBits::eColor);
+        textureImageView = createImageView(
+            *textureImage,
+            TEXTURE_FORMAT,
+            vk::ImageAspectFlagBits::eColor,
+            textureMipLevels);
     }
 
     void createTextureSampler()
@@ -1936,7 +2021,7 @@ private:
             .compareEnable = vk::False,
             .compareOp = vk::CompareOp::eAlways,
             .minLod = 0.0F,
-            .maxLod = 0.0F,
+            .maxLod = vk::LodClampNone,
             .borderColor = vk::BorderColor::eIntOpaqueBlack,
             // Normalized UV coordinates keep sampling independent of image dimensions.
             .unnormalizedCoordinates = vk::False,
