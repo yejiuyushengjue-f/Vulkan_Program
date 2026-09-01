@@ -152,6 +152,8 @@ private:
     vk::raii::DebugUtilsMessengerEXT debugMessenger = nullptr;
     vk::raii::SurfaceKHR surface = nullptr;
     vk::raii::PhysicalDevice physicalDevice = nullptr;
+    // Use the highest sample count supported by both color and depth attachments.
+    vk::SampleCountFlagBits msaaSamples = vk::SampleCountFlagBits::e1;
     vk::raii::Device device = nullptr;
     vk::raii::Queue graphicsPresentQueue = nullptr;
     vk::raii::Queue transferQueue = nullptr;
@@ -162,6 +164,11 @@ private:
     std::vector<vk::raii::ImageView> swapChainImageViews;
     vk::SurfaceFormatKHR swapChainSurfaceFormat;
     vk::Extent2D swapChainExtent;
+    // The multisampled color image is resolved into the acquired swapchain image.
+    // Memory precedes the bound image and view for safe reverse-order RAII teardown.
+    vk::raii::DeviceMemory colorImageMemory = nullptr;
+    vk::raii::Image colorImage = nullptr;
+    vk::raii::ImageView colorImageView = nullptr;
     vk::Format depthFormat = vk::Format::eUndefined;
     // Memory precedes the bound image and its view for safe reverse-order teardown.
     vk::raii::DeviceMemory depthImageMemory = nullptr;
@@ -220,6 +227,7 @@ private:
         createLogicalDevice();
         createSwapChain();
         createImageViews();
+        createColorResources();
         createDepthResources();
         createDescriptorSetLayout();
         createGraphicsPipeline();
@@ -438,12 +446,37 @@ private:
 
         const bool supportsRequiredFeatures =
             features.template get<vk::PhysicalDeviceFeatures2>().features.samplerAnisotropy &&
+            features.template get<vk::PhysicalDeviceFeatures2>().features.sampleRateShading &&
             features.template get<vk::PhysicalDeviceVulkan11Features>().shaderDrawParameters &&
             features.template get<vk::PhysicalDeviceVulkan13Features>().dynamicRendering &&
             features.template get<vk::PhysicalDeviceVulkan13Features>().synchronization2 &&
             features.template get<vk::PhysicalDeviceExtendedDynamicStateFeaturesEXT>().extendedDynamicState;
 
         return supportsRequiredFeatures;
+    }
+
+    // Select the highest standard sample count supported by both attachment types.
+    [[nodiscard]] vk::SampleCountFlagBits getMaxUsableSampleCount() const
+    {
+        const auto properties = physicalDevice.getProperties();
+        const auto counts = properties.limits.framebufferColorSampleCounts & properties.limits.framebufferDepthSampleCounts;
+
+        constexpr std::array candidates{
+            vk::SampleCountFlagBits::e64,
+            vk::SampleCountFlagBits::e32,
+            vk::SampleCountFlagBits::e16,
+            vk::SampleCountFlagBits::e8,
+            vk::SampleCountFlagBits::e4,
+            vk::SampleCountFlagBits::e2,
+            vk::SampleCountFlagBits::e1,
+        };
+        const auto supported = std::ranges::find_if(
+            candidates,
+            [counts](vk::SampleCountFlagBits candidate) {
+                return static_cast<bool>(counts & candidate);
+            });
+
+        return supported != candidates.end() ? *supported : vk::SampleCountFlagBits::e1;
     }
 
     // Pick the first physical device that satisfies every required capability
@@ -465,6 +498,7 @@ private:
         }
 
         physicalDevice = *suitableDevice;
+        msaaSamples = getMaxUsableSampleCount();
         graphicsPresentQueueFamilyIndex = findGraphicsAndPresentQueueFamily(physicalDevice).value();
         transferQueueFamilyIndex = findDedicatedTransferQueueFamily(physicalDevice).value();
     }
@@ -552,7 +586,12 @@ private:
             vk::PhysicalDeviceVulkan13Features,
             vk::PhysicalDeviceExtendedDynamicStateFeaturesEXT>
             featureChain{
-                {.features = {.samplerAnisotropy = true}}, // Anisotropic texture filtering
+                {
+                    .features = {
+                        .sampleRateShading = true,         // Run fragment shading for a fraction of covered samples
+                        .samplerAnisotropy = true,         // Anisotropic texture filtering
+                    },
+                },
                 {.shaderDrawParameters = true},         // Vulkan 1.1 shader draw parameters
                 {
                     .synchronization2 = true,           // Vulkan 1.3 synchronization commands
@@ -882,12 +921,13 @@ private:
             .lineWidth = 1.0F,
         };
 
-        // Use one sample per pixel; multisample antialiasing is introduced later
+        // Rasterize at the selected MSAA count and shade at least 20% of covered
+        // samples independently, reducing shader/texture aliasing inside polygons.
         const vk::PipelineMultisampleStateCreateInfo multisampling{
             .flags = vk::PipelineMultisampleStateCreateFlags{0},
-            .rasterizationSamples = vk::SampleCountFlagBits::e1,
-            .sampleShadingEnable = vk::False,
-            .minSampleShading = 1.0F,
+            .rasterizationSamples = msaaSamples,
+            .sampleShadingEnable = vk::True,
+            .minSampleShading = 0.2F,
             .pSampleMask = nullptr,
             .alphaToCoverageEnable = vk::False,
             .alphaToOneEnable = vk::False,
@@ -1069,6 +1109,23 @@ private:
             vk::ImageAspectFlagBits::eColor
         );
 
+        const bool multisamplingEnabled = msaaSamples != vk::SampleCountFlagBits::e1;
+        if (multisamplingEnabled) {
+            // The shared MSAA target is reused by consecutive frames. This barrier
+            // both discards its old pixels and orders this frame after the prior write.
+            transitionImageLayout(
+                commandBuffer,
+                *colorImage,
+                vk::ImageLayout::eUndefined,
+                vk::ImageLayout::eColorAttachmentOptimal,
+                vk::AccessFlagBits2::eColorAttachmentWrite,
+                vk::AccessFlagBits2::eColorAttachmentWrite,
+                vk::PipelineStageFlagBits2::eColorAttachmentOutput,
+                vk::PipelineStageFlagBits2::eColorAttachmentOutput,
+                vk::ImageAspectFlagBits::eColor
+            );
+        }
+
         // Previous depth contents are discarded, then the image becomes writable
         // by both early and late depth/stencil tests for this rendering pass.
         transitionImageLayout(
@@ -1093,13 +1150,16 @@ private:
         clearDepth.setDepthStencil(vk::ClearDepthStencilValue{1.0F, 0});
 
         const vk::RenderingAttachmentInfo colorAttachmentInfo{
-            .imageView = *swapChainImageViews.at(imageIndex),
+            // With MSAA, render into the private multisampled image and resolve its
+            // samples into the single-sampled image acquired from the swapchain.
+            .imageView = multisamplingEnabled ? *colorImageView : *swapChainImageViews.at(imageIndex),
             .imageLayout = vk::ImageLayout::eColorAttachmentOptimal,
-            .resolveMode = vk::ResolveModeFlagBits::eNone,
-            .resolveImageView = nullptr,
-            .resolveImageLayout = vk::ImageLayout::eUndefined,
+            .resolveMode = multisamplingEnabled ? vk::ResolveModeFlagBits::eAverage : vk::ResolveModeFlagBits::eNone,
+            .resolveImageView = multisamplingEnabled ? *swapChainImageViews.at(imageIndex) : vk::ImageView{nullptr},
+            .resolveImageLayout = multisamplingEnabled ? vk::ImageLayout::eColorAttachmentOptimal : vk::ImageLayout::eUndefined,
             .loadOp = vk::AttachmentLoadOp::eClear,
-            .storeOp = vk::AttachmentStoreOp::eStore,
+            // The multisampled pixels are temporary once resolve has completed.
+            .storeOp = multisamplingEnabled ? vk::AttachmentStoreOp::eDontCare : vk::AttachmentStoreOp::eStore,
             .clearValue = clearValue,
         };
         const vk::RenderingAttachmentInfo depthAttachmentInfo{
@@ -1328,6 +1388,10 @@ private:
         graphicsPipeline = nullptr;
         pipelineLayout = nullptr;
         renderFinishedSemaphores.clear();
+        // Destroy dependent views and images before releasing their bound memory.
+        colorImageView = nullptr;
+        colorImage = nullptr;
+        colorImageMemory = nullptr;
         // Destroy the view and image before releasing the memory bound to it.
         depthImageView = nullptr;
         depthImage = nullptr;
@@ -1357,6 +1421,7 @@ private:
 
         createSwapChain();
         createImageViews();
+        createColorResources();
         createDepthResources();
         createGraphicsPipeline();
         createRenderFinishedSemaphores();
@@ -1586,7 +1651,7 @@ private:
 
     [[nodiscard]] AllocatedImage createImage(
         uint32_t width, uint32_t height,
-        uint32_t mipLevels,
+        uint32_t mipLevels, vk::SampleCountFlagBits numSamples,
         vk::Format format, vk::ImageTiling tiling,
         vk::ImageUsageFlags usage,
         vk::MemoryPropertyFlags properties,
@@ -1605,7 +1670,7 @@ private:
             .extent = {width, height, 1},
             .mipLevels = mipLevels,
             .arrayLayers = 1,
-            .samples = vk::SampleCountFlagBits::e1,
+            .samples = numSamples,
             .tiling = tiling,
             .usage = usage,
             .sharingMode = shareBetweenTransferAndGraphics ? vk::SharingMode::eConcurrent : vk::SharingMode::eExclusive,
@@ -1675,6 +1740,36 @@ private:
         }
     }
 
+    void createColorResources()
+    {
+        if (*colorImage != nullptr || *colorImageMemory != nullptr || *colorImageView != nullptr) {
+            throw std::logic_error("Color resources have already been created!");
+        }
+
+        // A device is allowed to support only one sample. In that case rendering
+        // goes directly to the swapchain and no resolve attachment is necessary.
+        if (msaaSamples == vk::SampleCountFlagBits::e1) {
+            return;
+        }
+
+        auto allocatedColorImage = createImage(
+            swapChainExtent.width,
+            swapChainExtent.height,
+            1,
+            msaaSamples,
+            swapChainSurfaceFormat.format,
+            vk::ImageTiling::eOptimal,
+            vk::ImageUsageFlagBits::eTransientAttachment | vk::ImageUsageFlagBits::eColorAttachment,
+            vk::MemoryPropertyFlagBits::eDeviceLocal);
+        colorImageMemory = std::move(allocatedColorImage.memory);
+        colorImage = std::move(allocatedColorImage.image);
+        colorImageView = createImageView(
+            *colorImage,
+            swapChainSurfaceFormat.format,
+            vk::ImageAspectFlagBits::eColor,
+            1);
+    }
+
     void createDepthResources()
     {
         if (*depthImage != nullptr || *depthImageMemory != nullptr || *depthImageView != nullptr) {
@@ -1686,6 +1781,7 @@ private:
             swapChainExtent.width,
             swapChainExtent.height,
             1,
+            msaaSamples,
             depthFormat,
             vk::ImageTiling::eOptimal,
             vk::ImageUsageFlagBits::eDepthStencilAttachment,
@@ -1979,6 +2075,9 @@ private:
             static_cast<uint32_t>(textureWidth),
             static_cast<uint32_t>(textureHeight),
             textureMipLevels,
+            // Sampled textures remain single-sampled; MSAA applies to framebuffer
+            // attachments, and multisampled images cannot carry this mip chain.
+            vk::SampleCountFlagBits::e1,
             TEXTURE_FORMAT,
             vk::ImageTiling::eOptimal,
             vk::ImageUsageFlagBits::eTransferSrc | vk::ImageUsageFlagBits::eTransferDst | vk::ImageUsageFlagBits::eSampled,
